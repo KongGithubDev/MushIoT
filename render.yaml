@@ -11,6 +11,8 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
+      - key: NPM_CONFIG_PRODUCTION
+        value: "false"
       - key: MONGODB_URI
         sync: false
       - key: RATE_LIMIT_WINDOW_MS

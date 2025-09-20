@@ -3,6 +3,9 @@
   "private": true,
   "version": "0.0.0",
   "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "dev": "vite",
     "build": "vite build",
@@ -46,11 +49,17 @@
     "clsx": "^2.1.1",
     "cmdk": "^1.1.1",
     "compression": "^1.8.1",
+    "cors": "^2.8.5",
     "date-fns": "^3.6.0",
+    "dotenv": "^16.4.5",
     "embla-carousel-react": "^8.6.0",
     "express": "^5.1.0",
+    "express-rate-limit": "^7.4.0",
+    "helmet": "^7.1.0",
     "input-otp": "^1.4.2",
     "lucide-react": "^0.462.0",
+    "mongoose": "^8.8.2",
+    "morgan": "^1.10.0",
     "next-themes": "^0.3.0",
     "react": "^18.3.1",
     "react-day-picker": "^8.10.1",

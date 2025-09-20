@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: mushiot
+    env: node
+    plan: free
+    region: singapore
+    buildCommand: npm ci && npm run build
+    startCommand: node server.js
+    autoDeploy: true
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: MONGODB_URI
+        sync: false
+      - key: RATE_LIMIT_WINDOW_MS
+        value: "60000"
+      - key: RATE_LIMIT_MAX
+        value: "120"
+      - key: ALLOWED_ORIGINS
+        value: ""

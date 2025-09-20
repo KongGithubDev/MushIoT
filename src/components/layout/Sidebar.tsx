@@ -6,10 +6,12 @@ import {
   History, 
   MessageCircle, 
   Sliders,
-  ChevronLeft
+  ChevronLeft,
+  Shield
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
+import { useAuth } from "@/contexts/AuthContext";
 
 interface SidebarProps {
   isOpen: boolean;
@@ -26,6 +28,7 @@ const navigation = [
 ];
 
 export function Sidebar({ isOpen, onToggle }: SidebarProps) {
+  const { user } = useAuth();
   return (
     <aside className={cn(
       "fixed left-0 top-0 z-50 h-full bg-card border-r border-border transition-all duration-300 shadow-medium",
@@ -85,6 +88,30 @@ export function Sidebar({ isOpen, onToggle }: SidebarProps) {
               )}
             </NavLink>
           ))}
+          {user?.role === 'admin' && (
+            <NavLink
+              to="/admin"
+              className={({ isActive }) =>
+                cn(
+                  "flex items-center gap-3 px-3 py-2.5 rounded-lg transition-all duration-200 group relative",
+                  isActive
+                    ? "bg-primary/10 text-primary border border-primary/20"
+                    : "text-muted-foreground hover:text-foreground hover:bg-accent",
+                  !isOpen && "justify-center"
+                )
+              }
+            >
+              <Shield className="h-5 w-5 flex-shrink-0" />
+              {isOpen && (
+                <span className="font-medium">Admin</span>
+              )}
+              {!isOpen && (
+                <div className="absolute left-full ml-2 px-2 py-1 bg-popover text-popover-foreground text-sm rounded-md shadow-medium opacity-0 pointer-events-none group-hover:opacity-100 transition-opacity duration-200 whitespace-nowrap z-50">
+                  Admin
+                </div>
+              )}
+            </NavLink>
+          )}
         </nav>
 
         {/* Footer */}

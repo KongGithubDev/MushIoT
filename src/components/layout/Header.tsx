@@ -7,6 +7,7 @@ import { useConnection } from "@/contexts/ConnectionContext";
 import { useQuery } from "@tanstack/react-query";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { useSearchParams } from "react-router-dom";
+import { useAuth } from "@/contexts/AuthContext";
 
 interface HeaderProps {
   onMenuClick: () => void;
@@ -18,6 +19,7 @@ export function Header({ onMenuClick }: HeaderProps) {
   const { online, checking, reconnect, lastChecked } = useConnection();
   const [searchParams, setSearchParams] = useSearchParams();
   const currentDeviceId = searchParams.get('deviceId') || '';
+  const { user, logout } = useAuth();
 
   const { data: deviceIds } = useQuery<string[]>({
     queryKey: ["devices"],
@@ -126,6 +128,12 @@ export function Header({ onMenuClick }: HeaderProps) {
               <RefreshCcw className="h-4 w-4 mr-2" />
               {checking ? 'Checking...' : 'Reconnect'}
             </Button>
+            <div className="flex items-center gap-2 ml-4">
+              {user?.email && (
+                <Badge variant="secondary" className="bg-muted">{user.email}</Badge>
+              )}
+              <Button size="sm" variant="outline" onClick={logout}>Logout</Button>
+            </div>
           </div>
 
         </div>

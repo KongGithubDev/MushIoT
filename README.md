@@ -1,6 +1,6 @@
 # MushIoT
 
-A modern IoT web app to monitor and control mushroom cultivation soil moisture with an ESP32. The frontend is built with Vite + React + Tailwind, the backend is an Express (Node.js) server with MongoDB for storage. Includes an ESP32 Arduino sketch for a capacitive soil moisture sensor, I2C LCD, and relay-driven 12V water pump.
+A production-ready IoT web app to monitor and control mushroom cultivation soil moisture with ESP32 devices. The frontend is built with Vite + React + Tailwind, the backend is an Express (Node.js) server with MongoDB for storage. Includes an ESP32 Arduino sketch for a capacitive soil moisture sensor, I2C LCD, and relay-driven 12V water pump.
 
 ## Tech Stack
 - Frontend: React 18, Vite, Tailwind CSS, @tanstack/react-query, Recharts
@@ -49,26 +49,28 @@ A modern IoT web app to monitor and control mushroom cultivation soil moisture w
 - Arduino IDE (ESP32 boards package installed)
 
 ### 2) Environment Variables
-Create `.env` from `.env.example` and set:
+Create `.env` from `.env.example` and set at minimum:
 ```
 PORT=3000
 NODE_ENV=production
 MONGODB_URI=mongodb://localhost:27017/mushiot  # or Atlas URI
 MONGODB_DB=mushiot
-# CORS
+
+# CORS (comma-separated). In production set to your domain(s) for best security.
 ALLOWED_ORIGINS=http://localhost:3000
+
 # Rate limiting
 RATE_LIMIT_WINDOW_MS=60000
 RATE_LIMIT_MAX=120
 
-# Optional CORS whitelist
-ALLOWED_ORIGINS=http://localhost:3000
+# Optional secure device provisioning secret
+# When set, key rotation endpoint requires header: x-enroll-secret: $ENROLL_SECRET
+ENROLL_SECRET=
 ```
 
 ### 3) Install & Run (Production-like)
 ```
 npm install
-npm install mongoose dotenv cors helmet morgan express-rate-limit
 npm run build
 npm run start
 ```
@@ -86,6 +88,22 @@ docker build -t mushiot:prod .
 docker run -d --name mushiot -p 3000:3000 --env-file .env mushiot:prod
 ```
 If MongoDB runs on the host, use `MONGODB_URI=mongodb://host.docker.internal:27017/mushiot` in `.env`.
+
+### 6) Deploy to Render.com
+- Connect your repository and create a Web Service.
+- Render will use `render.yaml` which sets:
+  - Build: `npm install && npm run build`
+  - Start: `node server.js`
+  - Health check: `/api/health`
+- In the Render dashboard set these environment variables:
+  - `MONGODB_URI` (required)
+  - `NODE_ENV=production`
+  - `NPM_CONFIG_PRODUCTION=false` (ensures dev deps installed to build the frontend)
+  - `ALLOWED_ORIGINS` (optional but recommended)
+  - `ENROLL_SECRET` (optional; enables secure device enrollment)
+  - Rate limit vars as needed
+
+Once deployed, verify health at: `https://<your-service>.onrender.com/api/health`
 
 ## REST API (Highlights)
 - GET `/api/health` -> `{ status: "ok", time }`
@@ -106,13 +124,14 @@ If MongoDB runs on the host, use `MONGODB_URI=mongodb://host.docker.internal:270
 - GET `/api/devices/:deviceId/ack`
   - Returns the latest ACK or `null`
 
-### Security (API Key)
-- POST `/api/devices/:deviceId/rotate-key` → `{ deviceId, apiKey }`
-  - Use this to generate the key for each device.
-- Device-origin endpoints require header: `x-api-key: <DEVICE_API_KEY>`
-  - POST `/api/readings`
-  - POST `/api/devices/:deviceId/ack`
-  - GET `/api/devices/:deviceId/settings` (device polling)
+### Security (API Key & Enrollment)
+- Device key rotation: `POST /api/devices/:deviceId/rotate-key` → `{ deviceId, apiKey }`
+  - If `ENROLL_SECRET` is set on the server, this endpoint requires header: `x-enroll-secret: <ENROLL_SECRET>`.
+  - Use this endpoint to provision each device's API key.
+- Device-origin endpoints require header `x-api-key: <DEVICE_API_KEY>`:
+  - `POST /api/readings`
+  - `POST /api/devices/:deviceId/ack`
+  - `GET /api/devices/:deviceId/settings`
 
 ### Alerts (MongoDB)
 - GET `/api/alerts?deviceId=...` → list alerts
@@ -142,18 +161,20 @@ If MongoDB runs on the host, use `MONGODB_URI=mongodb://host.docker.internal:270
   - Pump: 12V DC + flyback diode (1N4007) across pump terminals
   - COMMON GND between ESP32, relay, sensor, and 12V supply
 - Configuration
-  - Set `WIFI_SSID`, `WIFI_PASSWORD`, `SERVER_HOST` (PC LAN IP), `SERVER_PORT`
-  - Set `DEVICE_ID` (e.g., `esp32-001`)
-  - Rotate API key from server and set `DEVICE_API_KEY`
-    - `POST /api/devices/<DEVICE_ID>/rotate-key`
-    - Copy `apiKey` into `DEVICE_API_KEY`
-  - Calibrate `DRY_ADC`, `WET_ADC`
-  - Hysteresis: `PUMP_ON_BELOW`, `PUMP_OFF_ABOVE` (defaults 35/45)
+  - Set `WIFI_SSID`, `WIFI_PASSWORD`.
+  - Server for production: `SERVER_HOST="mushiot.onrender.com"`, `SERVER_PORT=443`, `SERVER_USE_HTTPS=true` (already set).
+  - `DEVICE_ID` supports auto mode: set to `"auto"` to derive from ESP32 MAC (e.g., `esp32-a1b2c3`).
+  - API key provisioning is automatic:
+    - On first boot, the firmware calls `POST /api/devices/<DEVICE_ID>/rotate-key` and stores the returned `apiKey` in NVS (Preferences).
+    - The device then uses this key for all `x-api-key` protected requests.
+  - Optional: set `ENROLL_SECRET` in firmware to match the server if secure enrollment is enabled.
+  - Calibrate `DRY_ADC`, `WET_ADC` for your sensor; adjust hysteresis `PUMP_ON_BELOW` / `PUMP_OFF_ABOVE`.
 - Behavior
   - Poll settings every 3s: `GET /api/devices/<id>/settings`
     - Auto -> uses hysteresis; Manual -> overrides relay by `overridePumpOn`
   - Send readings every 10s: `POST /api/readings`
   - Send ACK on state change or after applying settings: `POST /api/devices/<id>/ack`
+  - Auto-provisioning retries in loop if initial key request fails.
   - LCD shows moisture and pump state, or "Not connected" on WiFi loss
 
 ## Frontend
@@ -180,6 +201,19 @@ If MongoDB runs on the host, use `MONGODB_URI=mongodb://host.docker.internal:270
 - Do not power ESP32 from 12V.
 - Ensure flyback diode installed across the pump.
 - If relay triggers unreliably with 3.3V logic, use a 3.3V-compatible relay or a transistor driver.
+- TLS note: the firmware uses `WiFiClientSecure.setInsecure()` to simplify HTTPS. For production hardening, load a CA cert via `setCACert(...)`.
+
+## Multi-Device Setup (Production)
+- Flash the same firmware to all ESP32s.
+- Each device uses `DEVICE_ID="auto"` and provisions its own API key on first boot.
+- Rename devices if desired by updating `deviceId` via database or by re-flashing with a fixed `DEVICE_ID`.
+- The web app lists all devices from `GET /api/devices`; pick a device from the selector in the header.
+
+## Operations
+- Rotate a device key (e.g., if compromised): `POST /api/devices/<id>/rotate-key`.
+- View recent readings: `GET /api/readings?deviceId=<id>&limit=50`.
+- Inspect watering events: `GET /api/watering?deviceId=<id>`.
+- Tune thresholds/modes: `PATCH /api/devices/<id>/settings` with `pumpMode`, `overridePumpOn`, `pumpOnBelow`, `pumpOffAbove`.
 
 ## Troubleshooting
 - Device shows Offline but Server Online:

@@ -15,6 +15,20 @@ services:
         value: "false"
       - key: MONGODB_URI
         sync: false
+      - key: ENROLL_SECRET
+        sync: false
+      - key: ADMIN_TOKEN
+        sync: false
+      - key: FIRMWARE_VERSION
+        value: "1.0.0"
+      - key: FIRMWARE_URL
+        value: ""
+      - key: JWT_SECRET
+        sync: false
+      - key: ADMIN_EMAIL
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
       - key: RATE_LIMIT_WINDOW_MS
         value: "60000"
       - key: RATE_LIMIT_MAX

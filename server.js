@@ -1,3 +1,59 @@
+// ===== Users (for login) =====
+const userSchema = new mongoose.Schema(
+  {
+    email: { type: String, unique: true, index: true, required: true },
+    passwordHash: { type: String, required: true },
+    role: { type: String, enum: ['admin', 'user'], default: 'user' },
+  },
+  { timestamps: true }
+);
+const User = mongoose.models.User || mongoose.model('User', userSchema);
+
+function sha256(s) {
+  return crypto.createHash('sha256').update(s).digest('hex');
+}
+
+function base64url(input) {
+  return Buffer.from(input).toString('base64').replace(/=+$/,'').replace(/\+/g,'-').replace(/\//g,'_');
+}
+
+function signJwt(payload, secret, expiresInSec = 3600) {
+  const header = { alg: 'HS256', typ: 'JWT' };
+  const iat = Math.floor(Date.now()/1000);
+  const exp = iat + expiresInSec;
+  const body = { ...payload, iat, exp };
+  const head = base64url(JSON.stringify(header));
+  const pay = base64url(JSON.stringify(body));
+  const data = head + '.' + pay;
+  const sig = crypto.createHmac('sha256', secret).update(data).digest('base64').replace(/=+$/,'').replace(/\+/g,'-').replace(/\//g,'_');
+  return `${data}.${sig}`;
+}
+
+function verifyJwt(token, secret) {
+  const parts = token.split('.');
+  if (parts.length !== 3) throw new Error('bad token');
+  const [head, pay, sig] = parts;
+  const data = head + '.' + pay;
+  const expected = crypto.createHmac('sha256', secret).update(data).digest('base64').replace(/=+$/,'').replace(/\+/g,'-').replace(/\//g,'_');
+  if (expected !== sig) throw new Error('bad signature');
+  const payload = JSON.parse(Buffer.from(pay.replace(/-/g,'+').replace(/_/g,'/'),'base64').toString());
+  if (payload.exp && Math.floor(Date.now()/1000) > payload.exp) throw new Error('expired');
+  return payload;
+}
+
+function requireAuth(req, res, next) {
+  try {
+    if (!JWT_SECRET) return res.status(501).json({ error: 'auth not configured' });
+    const h = req.header('authorization') || '';
+    const m = h.match(/^Bearer (.+)$/i);
+    if (!m) return res.status(401).json({ error: 'missing token' });
+    const payload = verifyJwt(m[1], JWT_SECRET);
+    req.user = payload;
+    next();
+  } catch (e) {
+    return res.status(401).json({ error: 'invalid token' });
+  }
+}
 import express from 'express';
 import compression from 'compression';
 import path from 'path';
@@ -8,6 +64,7 @@ import dotenv from 'dotenv';
 import helmet from 'helmet';
 import morgan from 'morgan';
 import rateLimit from 'express-rate-limit';
+import crypto from 'crypto';
 
 // Load environment variables
 dotenv.config();
@@ -20,6 +77,13 @@ const PORT = process.env.PORT || 3000;
 const MONGODB_URI = process.env.MONGODB_URI || '';
 const DIST_DIR = path.resolve(__dirname, 'dist');
 const NODE_ENV = process.env.NODE_ENV || 'production';
+const ENROLL_SECRET = process.env.ENROLL_SECRET || '';
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
+const JWT_SECRET = process.env.JWT_SECRET || '';
+const ADMIN_EMAIL = process.env.ADMIN_EMAIL || '';
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
+const FIRMWARE_VERSION = process.env.FIRMWARE_VERSION || '';
+const FIRMWARE_URL = process.env.FIRMWARE_URL || '';
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
 const RATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS || 60_000);
 const RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_MAX || 120);
@@ -57,6 +121,71 @@ const apiLimiter = rateLimit({
   legacyHeaders: false,
 });
 
+// ===== Admin utilities (protected by ADMIN_TOKEN) =====
+function requireAdmin(req, res, next) {
+  // Option 1: JWT admin user
+  if (JWT_SECRET) {
+    const h = req.header('authorization') || '';
+    const m = h.match(/^Bearer (.+)$/i);
+    if (m) {
+      try {
+        const payload = verifyJwt(m[1], JWT_SECRET);
+        if (payload.role === 'admin') {
+          req.user = payload;
+          return next();
+        }
+      } catch {}
+    }
+  }
+  // Option 2: Admin token header
+  if (ADMIN_TOKEN) {
+    const tok = req.header('x-admin-token');
+    if (tok === ADMIN_TOKEN) return next();
+    return res.status(403).json({ error: 'forbidden' });
+  }
+  return res.status(501).json({ error: 'admin not configured' });
+}
+
+// Revoke/rotate API key for a device (admin)
+app.post('/api/admin/devices/:deviceId/revoke-key', requireAdmin, async (req, res) => {
+  try {
+    const { deviceId } = req.params;
+    const newKey = Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+    const s = await DeviceSettings.findOneAndUpdate(
+      { deviceId },
+      { $set: { apiKey: newKey } },
+      { new: true, upsert: true }
+    );
+    res.json({ deviceId: s.deviceId, apiKey: s.apiKey });
+  } catch (e) {
+    console.error('POST /api/admin/devices/:deviceId/revoke-key error:', e);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
+// Rename a device across collections (admin)
+app.post('/api/admin/devices/:deviceId/rename', requireAdmin, async (req, res) => {
+  try {
+    const { deviceId } = req.params;
+    const { newId } = req.body || {};
+    if (!newId || typeof newId !== 'string') return res.status(400).json({ error: 'newId required' });
+    // Update DeviceSettings
+    await DeviceSettings.updateMany({ deviceId }, { $set: { deviceId: newId } });
+    // Update other collections
+    const updates = await Promise.all([
+      Reading.updateMany({ deviceId }, { $set: { deviceId: newId } }),
+      Ack.updateMany({ deviceId }, { $set: { deviceId: newId } }),
+      WateringEvent.updateMany({ deviceId }, { $set: { deviceId: newId } }),
+      Alert.updateMany({ deviceId }, { $set: { deviceId: newId } }),
+      Schedule.updateMany({ deviceId }, { $set: { deviceId: newId } }),
+    ]);
+    res.json({ oldId: deviceId, newId, updated: updates.map(u => u.modifiedCount) });
+  } catch (e) {
+    console.error('POST /api/admin/devices/:deviceId/rename error:', e);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
 // Application settings (singleton)
 const appSettingsSchema = new mongoose.Schema(
   {
@@ -68,6 +197,10 @@ const appSettingsSchema = new mongoose.Schema(
       dataRetention: Number,
       darkMode: Boolean,
       language: String,
+    },
+    ota: {
+      version: String,
+      url: String,
     },
     connection: {
       apiEndpoint: String,
@@ -323,6 +456,60 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', time: new Date().toISOString() });
 });
 
+// OTA manifest (simple global manifest; could be extended per device)
+app.get('/api/ota/manifest', async (req, res) => {
+  try {
+    const doc = await getAppSettings();
+    const v = doc?.ota?.version || FIRMWARE_VERSION;
+    const u = doc?.ota?.url || FIRMWARE_URL;
+    res.json({ version: v, url: u });
+  } catch (e) {
+    res.json({ version: FIRMWARE_VERSION, url: FIRMWARE_URL });
+  }
+});
+
+// Admin: set OTA manifest values in AppSettings
+app.post('/api/admin/ota', requireAdmin, async (req, res) => {
+  try {
+    const { version, url } = req.body || {};
+    const update = { };
+    if (version !== undefined) update['ota.version'] = version;
+    if (url !== undefined) update['ota.url'] = url;
+    const doc = await AppSettings.findOneAndUpdate({ _id: 'global' }, { $set: update }, { new: true, upsert: true });
+    res.json({ version: doc?.ota?.version || null, url: doc?.ota?.url || null });
+  } catch (e) {
+    console.error('POST /api/admin/ota error:', e);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
+// Auth endpoints
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    if (!JWT_SECRET) return res.status(501).json({ error: 'auth not configured' });
+    const { email, password } = req.body || {};
+    if (!email || !password) return res.status(400).json({ error: 'email and password required' });
+    const u = await User.findOne({ email });
+    if (!u) return res.status(401).json({ error: 'invalid credentials' });
+    const ok = u.passwordHash === sha256(password);
+    if (!ok) return res.status(401).json({ error: 'invalid credentials' });
+    const token = signJwt({ sub: u._id.toString(), email: u.email, role: u.role }, JWT_SECRET, 24*3600);
+    res.json({ token, user: { email: u.email, role: u.role } });
+  } catch (e) {
+    console.error('POST /api/auth/login error:', e);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
+app.get('/api/auth/me', requireAuth, async (req, res) => {
+  try {
+    const u = await User.findById(req.user.sub).select('email role');
+    res.json(u);
+  } catch (e) {
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
 // MongoDB connection and schema
 const readingSchema = new mongoose.Schema(
   {
@@ -542,6 +729,13 @@ app.patch('/api/devices/:deviceId/settings', async (req, res) => {
 app.post('/api/devices/:deviceId/rotate-key', async (req, res) => {
   try {
     const { deviceId } = req.params;
+    // Optional enrollment secret check (for provisioning security)
+    if (ENROLL_SECRET) {
+      const provided = req.header('x-enroll-secret') || '';
+      if (provided !== ENROLL_SECRET) {
+        return res.status(403).json({ error: 'forbidden' });
+      }
+    }
     const newKey = Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
     const s = await DeviceSettings.findOneAndUpdate(
       { deviceId },
@@ -570,6 +764,14 @@ async function start() {
     } else {
       await mongoose.connect(MONGODB_URI, { dbName: process.env.MONGODB_DB || undefined });
       console.log('Connected to MongoDB');
+      // Seed admin user
+      if (ADMIN_EMAIL && ADMIN_PASSWORD) {
+        const exists = await User.findOne({ email: ADMIN_EMAIL });
+        if (!exists) {
+          await User.create({ email: ADMIN_EMAIL, passwordHash: sha256(ADMIN_PASSWORD), role: 'admin' });
+          console.log('Admin user seeded:', ADMIN_EMAIL);
+        }
+      }
     }
     const server = app.listen(PORT, () => {
       console.log(`Server running at http://localhost:${PORT}`);

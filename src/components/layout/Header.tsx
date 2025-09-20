@@ -1,4 +1,4 @@
-import { Wifi, Clock, RefreshCcw } from "lucide-react";
+import { Wifi, Clock, RefreshCcw, MapPin } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { useEffect, useState } from "react";
@@ -6,7 +6,6 @@ import { useSidebar } from "@/contexts/SidebarContext";
 import { useConnection } from "@/contexts/ConnectionContext";
 import { useQuery } from "@tanstack/react-query";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { useSearchParams } from "react-router-dom";
 import { useAuth } from "@/contexts/AuthContext";
 
 interface HeaderProps {
@@ -17,11 +16,10 @@ export function Header({ onMenuClick }: HeaderProps) {
   const [currentTime, setCurrentTime] = useState(new Date());
   const { sidebarOpen } = useSidebar();
   const { online, checking, reconnect, lastChecked } = useConnection();
-  const [searchParams, setSearchParams] = useSearchParams();
-  const currentDeviceId = searchParams.get('deviceId') || '';
+  const [deviceId, setDeviceId] = useState<string>('');
   const { user, logout } = useAuth();
 
-  type DeviceItem = { deviceId: string; name: string; online: boolean };
+  type DeviceItem = { deviceId: string; name: string; online: boolean; location?: string };
   const { data: devices, error: devicesError, isLoading: devicesLoading } = useQuery<DeviceItem[]>({
     queryKey: ["devices", "registry"],
     queryFn: async () => {
@@ -34,8 +32,8 @@ export function Header({ onMenuClick }: HeaderProps) {
 
   // Device heartbeat via latest reading (fallback when registry info unavailable)
   type Reading = { _id: string; createdAt: string };
-  const selectedFromRegistry = (devices || []).find(d => d.deviceId === currentDeviceId) || (devices && devices[0]);
-  const effectiveDeviceId = currentDeviceId || selectedFromRegistry?.deviceId || '';
+  const selectedFromRegistry = (devices || []).find(d => d.deviceId === deviceId) || (devices && devices[0]);
+  const effectiveDeviceId = deviceId || selectedFromRegistry?.deviceId || '';
   const selectedLabel = (() => {
     const d = (devices || []).find(x => x.deviceId === effectiveDeviceId);
     if (d) return `${d.name || d.deviceId}${d.online ? ' • Online' : ''}`;
@@ -62,28 +60,30 @@ export function Header({ onMenuClick }: HeaderProps) {
     return ageMs < 30_000;
   })();
 
-  // Initialize/sync deviceId in URL if missing
+  // Initialize/sync deviceId from localStorage and registry
   useEffect(() => {
-    if (!currentDeviceId && devices && devices.length > 0) {
-      const id = devices[0].deviceId;
-      const next = new URLSearchParams(searchParams);
-      next.set('deviceId', id);
-      setSearchParams(next, { replace: true });
+    const list = devices || [];
+    if (!list.length) return;
+    const stored = localStorage.getItem('deviceId') || '';
+    const validStored = stored && list.some(d => d.deviceId === stored);
+    const next = validStored ? stored : (list[0]?.deviceId || '');
+    if (next && next !== deviceId) {
+      setDeviceId(next);
+      localStorage.setItem('deviceId', next);
     }
-  }, [currentDeviceId, devices, searchParams, setSearchParams]);
+  }, [devices]);
 
-  // Validate: if current deviceId is not in registry, reset to first or remove
+  // Sync across tabs/pages
   useEffect(() => {
-    if (currentDeviceId && devices) {
-      const exists = devices.some(d => d.deviceId === currentDeviceId);
-      if (!exists) {
-        const next = new URLSearchParams(searchParams);
-        if (devices.length > 0) next.set('deviceId', devices[0].deviceId);
-        else next.delete('deviceId');
-        setSearchParams(next, { replace: true });
+    const onStorage = (e: StorageEvent) => {
+      if (e.key === 'deviceId') {
+        const v = e.newValue || '';
+        if (v && v !== deviceId) setDeviceId(v);
       }
-    }
-  }, [currentDeviceId, devices, searchParams, setSearchParams]);
+    };
+    window.addEventListener('storage', onStorage);
+    return () => window.removeEventListener('storage', onStorage);
+  }, [deviceId]);
 
   useEffect(() => {
     const timer = setInterval(() => setCurrentTime(new Date()), 1000);
@@ -103,7 +103,7 @@ export function Header({ onMenuClick }: HeaderProps) {
 
           <div className="flex items-center gap-4">
             {/* Global Device Selector or read-only badge if single/unknown */}
-            <div>
+            <div className="flex items-center gap-2">
               {devicesError ? (
                 <Badge variant="destructive">Devices unavailable</Badge>
               ) : devicesLoading ? (
@@ -111,11 +111,7 @@ export function Header({ onMenuClick }: HeaderProps) {
               ) : devices && devices.length > 1 ? (
                 <Select
                   value={effectiveDeviceId}
-                  onValueChange={(val) => {
-                    const next = new URLSearchParams(searchParams);
-                    next.set('deviceId', val);
-                    setSearchParams(next);
-                  }}
+                  onValueChange={(val) => { setDeviceId(val); localStorage.setItem('deviceId', val); }}
                 >
                   <SelectTrigger className="w-[260px]">
                     <div className="truncate text-left w-full">{selectedLabel}</div>
@@ -129,6 +125,15 @@ export function Header({ onMenuClick }: HeaderProps) {
               ) : devices && devices.length === 1 ? (
                 <Badge variant="secondary" className="bg-muted">{devices[0].name || devices[0].deviceId}</Badge>
               ) : null}
+              {(() => {
+                const loc = selectedFromRegistry?.location || (devices && devices.length === 1 ? devices[0].location : undefined);
+                if (!loc) return null;
+                return (
+                  <Badge variant="outline" title={loc} className="max-w-[220px] truncate">
+                    <MapPin className="h-3 w-3 mr-1" /> {loc}
+                  </Badge>
+                );
+              })()}
             </div>
 
             {(() => {

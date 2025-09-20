@@ -56,8 +56,8 @@ int PUMP_OFF_ABOVE = 45;  // turn pump OFF when moisture% > 45
 // Ensure a minimum ON time to protect pump
 const unsigned long MIN_PUMP_ON_MS = 5000; // 5 seconds
 
-// Send interval in milliseconds
-const unsigned long SEND_INTERVAL_MS = 60000; // 60 seconds
+// Send interval in milliseconds (configurable via device settings sendIntervalSec)
+unsigned long SEND_INTERVAL_MS = 60000; // default 60 seconds
 // Poll settings interval
 const unsigned long SETTINGS_POLL_MS = 3000; // 3 seconds
 // =====================================
@@ -68,6 +68,13 @@ unsigned long lastSettingsPoll = 0;
 unsigned long lastOtaCheck = 0;
 bool pumpOn = false;
 unsigned long pumpLastChanged = 0;
+
+// SSE (Server-Sent Events) state for instant settings nudge
+WiFiClient sseClient;
+WiFiClientSecure sseSecure;
+bool sseConnected = false;
+String sseBuffer;
+String sseLastEvent;
 
 // ========== Settings fetching (simple JSON parsing) ==========
 bool g_isManualMode = false;      // auto by default
@@ -84,6 +91,117 @@ String baseUrl() {
   if ((SERVER_USE_HTTPS && SERVER_PORT != 443) || (!SERVER_USE_HTTPS && SERVER_PORT != 80)) {
     host += ":" + String(SERVER_PORT);
   }
+
+void connectSse() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (sseConnected) return;
+  String host = String(SERVER_HOST);
+  int port = SERVER_PORT;
+  bool ok = false;
+  Serial.print("SSE: connecting to "); Serial.print(host); Serial.print(":"); Serial.println(port);
+  if (SERVER_USE_HTTPS) {
+    if (ROOT_CA_PEM && strlen(ROOT_CA_PEM) > 0) sseSecure.setCACert(ROOT_CA_PEM);
+    else sseSecure.setInsecure();
+    if (sseSecure.connect(host.c_str(), port)) {
+      ok = true;
+    }
+  } else {
+    if (sseClient.connect(host.c_str(), port)) {
+      ok = true;
+    }
+  }
+  if (!ok) { sseConnected = false; Serial.println("SSE: connect failed"); return; }
+  // Build request
+  String path = String("/api/devices/") + DEVICE_ID + "/stream";
+  String req = "GET " + path + " HTTP/1.1\r\n";
+  req += "Host: " + host + ":" + String(port) + "\r\n";
+  req += "Accept: text/event-stream\r\n";
+  req += "Cache-Control: no-cache\r\n";
+  req += "x-api-key: " + String(DEVICE_API_KEY) + "\r\n";
+  req += "Connection: keep-alive\r\n\r\n";
+  if (SERVER_USE_HTTPS) sseSecure.print(req); else sseClient.print(req);
+  sseConnected = true;
+  sseBuffer = "";
+  Serial.print("SSE: connected path "); Serial.println(path);
+}
+
+void pollSse() {
+  if (!sseConnected) { connectSse(); return; }
+  WiFiClient *c = SERVER_USE_HTTPS ? (WiFiClient*)&sseSecure : (WiFiClient*)&sseClient;
+  if (!c->connected()) { if (sseConnected) Serial.println("SSE: disconnected"); sseConnected = false; return; }
+  while (c->available()) {
+    char ch = c->read();
+    sseBuffer += ch;
+    // Process line by line
+    int nl = sseBuffer.indexOf('\n');
+    while (nl >= 0) {
+      String line = sseBuffer.substring(0, nl);
+      // trim CR
+      if (line.endsWith("\r")) line.remove(line.length()-1);
+      sseBuffer.remove(0, nl + 1);
+      // Handle SSE fields
+      if (line.startsWith("event:")) {
+        line.trim();
+        String ev = line.substring(6); ev.trim();
+        sseLastEvent = ev;
+        Serial.print("SSE: event "); Serial.println(ev);
+      } else if (line.startsWith("data:")) {
+        String data = line.substring(5);
+        data.trim();
+        Serial.print("SSE: data "); Serial.println(data);
+        if (sseLastEvent == "settings") {
+          fetchSettings();
+        } else if (sseLastEvent == "command") {
+          // Apply patch immediately
+          applyCommandPatch(data);
+        }
+      }
+      nl = sseBuffer.indexOf('\n');
+    }
+  }
+}
+
+void applyCommandPatch(const String &dataJson) {
+  bool isManual;
+  bool hasMode = parsePumpMode(dataJson, isManual);
+  bool ov;
+  bool hasOv = parseBool(dataJson, "overridePumpOn", ov);
+  int onBelow;
+  bool hasOn = parseIntField(dataJson, "pumpOnBelow", onBelow);
+  int offAbove;
+  bool hasOff = parseIntField(dataJson, "pumpOffAbove", offAbove);
+  int sendEvery;
+  bool hasSend = parseIntField(dataJson, "sendIntervalSec", sendEvery);
+
+  if (hasMode) g_isManualMode = isManual;
+  if (hasOv) g_overridePumpOn = ov;
+  if (hasOn) g_onBelow = onBelow;
+  if (hasOff) g_offAbove = offAbove;
+  if (hasSend && sendEvery >= 1 && sendEvery <= 3600) {
+    SEND_INTERVAL_MS = (unsigned long)sendEvery * 1000UL;
+  }
+  Serial.print("SSE: apply cmd patch mode="); Serial.print(g_isManualMode ? "manual" : "auto");
+  Serial.print(" override="); Serial.print(g_overridePumpOn ? "true" : "false");
+  Serial.print(" onBelow="); Serial.print(g_onBelow);
+  Serial.print(" offAbove="); Serial.print(g_offAbove);
+  Serial.print(" sendIntervalMs="); Serial.println(SEND_INTERVAL_MS);
+  // Apply desired pump state immediately, mirroring simulator behavior
+  // Estimate current moisture from last reading path is not stored; we decide based on control logic inputs.
+  // We will decide desired state using current pumpOn and thresholds (best effort without raw moisture).
+  bool desired = pumpOn;
+  if (g_isManualMode) {
+    desired = g_overridePumpOn;
+  } else {
+    // Without immediate moisture input available here, we keep current state in auto.
+    // The next controlPump() tick will enforce thresholds. We still ACK the mode change now.
+  }
+  if (desired != pumpOn) {
+    setPump(desired); // will toggle relay and send ACK with "relay state changed"
+  } else {
+    // Send a single immediate ACK to confirm command reception
+    postAck(pumpOn, g_isManualMode ? "manual" : "auto", "cmd");
+  }
+}
 
 // ===== OTA update =====
 bool parseManifest(const String &body, String &version, String &url) {
@@ -220,10 +338,16 @@ void fetchSettings() {
     bool overrideOn;
     int onBelow;
     int offAbove;
+    int sendEvery;
     if (parsePumpMode(body, isManual)) g_isManualMode = isManual;
     if (parseBool(body, "overridePumpOn", overrideOn)) g_overridePumpOn = overrideOn;
     if (parseIntField(body, "pumpOnBelow", onBelow)) g_onBelow = onBelow;
     if (parseIntField(body, "pumpOffAbove", offAbove)) g_offAbove = offAbove;
+    if (parseIntField(body, "sendIntervalSec", sendEvery)) {
+      if (sendEvery >= 1 && sendEvery <= 3600) {
+        SEND_INTERVAL_MS = (unsigned long)sendEvery * 1000UL;
+      }
+    }
     // ACK that settings were applied
     postAck(pumpOn, g_isManualMode ? "manual" : "auto", "settings applied");
   }
@@ -455,6 +579,9 @@ void setup() {
   if (!provisionApiKeyIfNeeded()) {
     Serial.println("Warning: API key provisioning failed. Will retry in loop.");
   }
+
+  // Connect SSE for instant nudge
+  connectSse();
 }
 
 void loop() {
@@ -487,6 +614,9 @@ void loop() {
     lastSend = now;
     postReading(raw, percent);
   }
+
+  // Poll SSE frequently (non-blocking)
+  pollSse();
 
   delay(250);
 }

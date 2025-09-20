@@ -52,6 +52,8 @@ export default function Settings() {
       dataRetention: sys.dataRetention ?? prev.dataRetention,
       darkMode: sys.darkMode ?? prev.darkMode,
       language: sys.language ?? prev.language,
+      deviceSendIntervalSec: sys.deviceSendIntervalSec ?? prev.deviceSendIntervalSec,
+      dashboardRefreshSec: sys.dashboardRefreshSec ?? prev.dashboardRefreshSec,
     }));
   };
 
@@ -121,7 +123,9 @@ export default function Settings() {
     autoBackup: true,
     dataRetention: 90,
     darkMode: false,
-    language: "en"
+    language: "en",
+    deviceSendIntervalSec: 60,
+    dashboardRefreshSec: 60,
   });
 
   // Connection Settings
@@ -345,6 +349,32 @@ export default function Settings() {
                     max="365"
                   />
                   <p className="text-xs text-muted-foreground">Note: Data retention applies to analytics. Server TTL uses environment DATA_RETENTION_DAYS if configured.</p>
+                </div>
+
+                <div className="space-y-2">
+                  <Label>Device Send Interval (seconds)</Label>
+                  <Input
+                    type="number"
+                    value={systemSettings.deviceSendIntervalSec}
+                    onChange={(e) => setSystemSettings(prev => ({ ...prev, deviceSendIntervalSec: parseInt(e.target.value) }))}
+                    onBlur={(e) => setSystemSettings(prev => ({ ...prev, deviceSendIntervalSec: clampNum(parseInt(e.target.value) || 60, 1, 3600) }))}
+                    min="1"
+                    max="3600"
+                  />
+                  <p className="text-xs text-muted-foreground">Default for new devices; can be overridden per-device in Device Settings.</p>
+                </div>
+
+                <div className="space-y-2">
+                  <Label>Dashboard Refresh (seconds)</Label>
+                  <Input
+                    type="number"
+                    value={systemSettings.dashboardRefreshSec}
+                    onChange={(e) => setSystemSettings(prev => ({ ...prev, dashboardRefreshSec: parseInt(e.target.value) }))}
+                    onBlur={(e) => setSystemSettings(prev => ({ ...prev, dashboardRefreshSec: clampNum(parseInt(e.target.value) || 60, 10, 600) }))}
+                    min="10"
+                    max="600"
+                  />
+                  <p className="text-xs text-muted-foreground">How often the dashboard chart auto-refreshes.</p>
                 </div>
               </div>
 

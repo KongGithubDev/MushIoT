@@ -1,4 +1,4 @@
-import { useEffect, useMemo } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { StatusCard } from "@/components/dashboard/StatusCard";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -15,7 +15,7 @@ import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContai
 import { useQuery } from "@tanstack/react-query";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { useConnection } from "@/contexts/ConnectionContext";
-import { useSearchParams } from "react-router-dom";
+// URL param no longer used for device selection; we store selection in localStorage
 
 type Reading = {
   _id: string;
@@ -44,9 +44,9 @@ type Ack = {
 
 export default function Dashboard() {
   const { online } = useConnection();
-  const [searchParams, setSearchParams] = useSearchParams();
+  const [deviceId, setDeviceId] = useState<string>("");
   // Device selection
-  type DeviceItem = { deviceId: string; name?: string; online?: boolean };
+  type DeviceItem = { deviceId: string; name?: string; online?: boolean; location?: string };
   const { data: registry } = useQuery<DeviceItem[]>({
     queryKey: ["devices", "registry"],
     queryFn: async () => {
@@ -56,27 +56,47 @@ export default function Dashboard() {
     },
     refetchInterval: 15000,
   });
-  const deviceId = useMemo(() => {
-    const fromUrl = searchParams.get('deviceId');
-    if (fromUrl && (registry || []).some(d => d.deviceId === fromUrl)) return fromUrl;
-    const first = registry && registry[0]?.deviceId;
-    return first || '';
-  }, [registry, searchParams]);
-
-  // If URL has no deviceId yet, set it so Header can pick it up immediately
+  // choose deviceId from localStorage or first registry item
   useEffect(() => {
-    const inUrl = searchParams.get('deviceId');
-    const validInUrl = inUrl && (registry || []).some(d => d.deviceId === inUrl);
-    const first = registry && registry[0]?.deviceId;
-    if (!validInUrl) {
-      const next = new URLSearchParams(searchParams);
-      if (first) next.set('deviceId', first);
-      else next.delete('deviceId');
-      setSearchParams(next, { replace: true });
+    const list = registry || [];
+    if (!list.length) return;
+    const stored = localStorage.getItem('deviceId') || '';
+    const validStored = stored && list.some(d => d.deviceId === stored);
+    const next = validStored ? stored : (list[0]?.deviceId || '');
+    if (next && next !== deviceId) {
+      setDeviceId(next);
+      localStorage.setItem('deviceId', next);
     }
-  }, [registry, searchParams, setSearchParams]);
+  }, [registry]);
+
+  // Sync with localStorage changes from other tabs/pages
+  useEffect(() => {
+    const onStorage = (e: StorageEvent) => {
+      if (e.key === 'deviceId') {
+        const v = e.newValue || '';
+        if (v && v !== deviceId) setDeviceId(v);
+      }
+    };
+    window.addEventListener('storage', onStorage);
+    return () => window.removeEventListener('storage', onStorage);
+  }, [deviceId]);
+
+  const currentDevice = useMemo(() => (registry || []).find(d => d.deviceId === deviceId), [registry, deviceId]);
 
   const hasDevice = !!deviceId;
+
+  // App Settings for dynamic dashboard refresh interval
+  const { data: appSettings } = useQuery<any>({
+    queryKey: ["app-settings"],
+    queryFn: async () => {
+      const res = await fetch('/api/app-settings');
+      if (!res.ok) throw new Error(`Failed to load app settings: ${res.status}`);
+      return res.json();
+    },
+    enabled: online,
+    refetchInterval: 60_000,
+  });
+  const refreshSec = Math.max(10, Number(appSettings?.system?.dashboardRefreshSec || 60));
 
   const { data: readings, isLoading, isError, error, refetch, isFetching } = useQuery<Reading[]>({
     queryKey: ["readings", deviceId],
@@ -85,7 +105,7 @@ export default function Dashboard() {
       if (!res.ok) throw new Error(`Failed to fetch readings: ${res.status}`);
       return res.json();
     },
-    refetchInterval: 60000,
+    refetchInterval: refreshSec * 1000,
     refetchOnWindowFocus: false,
     refetchIntervalInBackground: false,
     enabled: online && hasDevice,
@@ -104,14 +124,14 @@ export default function Dashboard() {
   });
 
   // Latest ACK from device (what is actually applied)
-  const { data: ack, isFetching: fetchingAck } = useQuery<Ack | null>({
+  const { data: ack, isFetching: fetchingAck, refetch: refetchAck } = useQuery<Ack | null>({
     queryKey: ["device-ack", deviceId],
     queryFn: async () => {
       const res = await fetch(`/api/devices/${encodeURIComponent(deviceId)}/ack`);
       if (!res.ok) throw new Error(`Failed to fetch ack: ${res.status}`);
       return res.json();
     },
-    refetchInterval: 3000,
+    // Do not poll frequently; we'll refetch manually when there's a meaningful update
     enabled: online && hasDevice,
   });
 
@@ -134,7 +154,92 @@ export default function Dashboard() {
     });
   }, [readings]);
 
+  // Animate chart only on first mount to avoid restart on unrelated re-renders (e.g., ACK polling)
+  const chartAnimatedRef = useRef(true);
+  useEffect(() => { chartAnimatedRef.current = false; }, []);
+
   const pumpMode: 'auto' | 'manual' = settings?.pumpMode ?? 'auto';
+  // When in manual mode, if ACK state doesn't yet match desired settings, we are waiting for device to apply
+  const waitingApply = useMemo(() => {
+    if (!settings || !ack) return false;
+    if (pumpMode !== 'manual') return false;
+    const desiredOn = !!(settings.overridePumpOn ?? false);
+    return !(ack.pumpMode === 'manual' && ack.pumpOn === desiredOn);
+  }, [settings, ack, pumpMode]);
+
+  const commandDelivered = useMemo(() => {
+    if (!ack) return false;
+    if (pumpMode === 'manual') {
+      const desiredOn = !!(settings?.overridePumpOn ?? false);
+      return ack.pumpMode === 'manual' && ack.pumpOn === desiredOn;
+    }
+    return ack.pumpMode === 'auto';
+  }, [ack, settings, pumpMode]);
+
+  // While waiting for device to apply, temporarily poll ACK faster to reflect the change sooner
+  const waitingPollStartRef = useRef<number | null>(null);
+  useEffect(() => {
+    let timer: any;
+    if (waitingApply && online && hasDevice) {
+      if (!waitingPollStartRef.current) waitingPollStartRef.current = Date.now();
+      timer = setInterval(() => {
+        // Stop fast polling after 15s to avoid spamming
+        const started = waitingPollStartRef.current || Date.now();
+        if (Date.now() - started > 15_000) {
+          clearInterval(timer);
+          return;
+        }
+        // refetch ACK
+        refetchAck();
+      }, 1000);
+    } else {
+      waitingPollStartRef.current = null;
+    }
+    return () => { if (timer) clearInterval(timer); };
+  }, [waitingApply, online, hasDevice, refetchAck]);
+
+  // UI SSE: listen for ack/reading/settings events to update UI realtime
+  useEffect(() => {
+    if (!hasDevice) return;
+    const es = new EventSource('/api/stream');
+    const onAck = (e: MessageEvent) => {
+      try {
+        const data = JSON.parse(e.data);
+        if (data?.deviceId === deviceId) {
+          refetchAck();
+        }
+      } catch {}
+    };
+    const onReading = (e: MessageEvent) => {
+      try {
+        const data = JSON.parse(e.data);
+        if (data?.deviceId === deviceId) {
+          // Lightly refetch ack to keep status fresh; charts (if any) can also react
+          refetchAck();
+        }
+      } catch {}
+    };
+    const onSettings = (e: MessageEvent) => {
+      try {
+        const data = JSON.parse(e.data);
+        if (data?.deviceId === deviceId) {
+          refetchSettings();
+          refetchAck();
+        }
+      } catch {}
+    };
+    es.addEventListener('ack', onAck as any);
+    es.addEventListener('reading', onReading as any);
+    es.addEventListener('settings', onSettings as any);
+    return () => {
+      try {
+        es.removeEventListener('ack', onAck as any);
+        es.removeEventListener('reading', onReading as any);
+        es.removeEventListener('settings', onSettings as any);
+        es.close();
+      } catch {}
+    };
+  }, [deviceId, hasDevice, refetchAck, refetchSettings]);
 
   const getMoistureStatus = (level: number) => {
     if (level > 60) return "success";
@@ -150,7 +255,7 @@ export default function Dashboard() {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ overridePumpOn: next })
-    }).then(() => refetchSettings());
+    }).then(() => { refetchSettings(); refetchAck(); });
   };
 
   const setMode = (mode: 'auto' | 'manual') => {
@@ -159,8 +264,19 @@ export default function Dashboard() {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ pumpMode: mode })
-    }).then(() => refetchSettings());
+    }).then(() => { refetchSettings(); refetchAck(); });
   };
+
+  // When a new reading arrives (timestamp changes), refresh ACK once to reflect device-applied state/time
+  const lastTriggeredAckTsRef = useRef<string | null>(null);
+  useEffect(() => {
+    const ts = latest?.createdAt || null;
+    if (!ts) return;
+    if (lastTriggeredAckTsRef.current !== ts) {
+      lastTriggeredAckTsRef.current = ts;
+      refetchAck();
+    }
+  }, [latest?.createdAt, refetchAck]);
 
   // Empty state when no devices
   if (!hasDevice) {
@@ -198,6 +314,20 @@ export default function Dashboard() {
         </div>
         
         <div className="flex items-center gap-2">
+          <div className="min-w-[220px]">
+            <Select value={deviceId} onValueChange={(v) => { setDeviceId(v); localStorage.setItem('deviceId', v); }}>
+              <SelectTrigger>
+                <SelectValue placeholder="Select device" />
+              </SelectTrigger>
+              <SelectContent>
+                {(registry || []).map((d) => (
+                  <SelectItem key={d.deviceId} value={d.deviceId}>
+                    {d.name || d.deviceId}{d.online ? ' • Online' : ''}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
           {isLoading ? (
             <Badge variant="secondary">Loading...</Badge>
           ) : isError ? (
@@ -257,7 +387,7 @@ export default function Dashboard() {
                   <TrendingUp className="h-5 w-5 text-primary" />
                   Soil Moisture Trend (24h)
                 </CardTitle>
-                <Badge variant="outline">{isFetching ? 'Refreshing...' : 'Auto refresh: 60s'}</Badge>
+                <Badge variant="outline">{isFetching ? 'Refreshing...' : `Auto refresh: ${refreshSec}s`}</Badge>
               </div>
             </CardHeader>
             <CardContent>
@@ -288,7 +418,7 @@ export default function Dashboard() {
                       stroke="hsl(var(--primary))" 
                       strokeWidth={3}
                       strokeLinecap="round"
-                      isAnimationActive={true}
+                      isAnimationActive={chartAnimatedRef.current}
                       animationDuration={700}
                       animationEasing="ease-in-out"
                       dot={{ fill: 'hsl(var(--primary))', strokeWidth: 2, r: 3 }}
@@ -321,6 +451,7 @@ export default function Dashboard() {
                     size="sm"
                     onClick={() => setMode('auto')}
                     className="flex-1"
+                    disabled={waitingApply}
                   >
                     Auto
                   </Button>
@@ -329,6 +460,7 @@ export default function Dashboard() {
                     size="sm"
                     onClick={() => setMode('manual')}
                     className="flex-1"
+                    disabled={waitingApply}
                   >
                     Manual
                   </Button>
@@ -344,9 +476,10 @@ export default function Dashboard() {
                 </div>
                 <Button
                   onClick={togglePump}
-                  disabled={pumpMode === 'auto'}
+                  disabled={pumpMode === 'auto' || waitingApply}
                   className="w-full"
                   variant={(settings?.overridePumpOn ?? false) ? 'destructive' : 'default'}
+                  title={waitingApply ? 'Waiting for device to apply previous command' : undefined}
                 >
                   {(settings?.overridePumpOn ?? false) ? (
                     <>
@@ -361,19 +494,28 @@ export default function Dashboard() {
                   )}
                 </Button>
                 {/* ACK status */}
-                <div className="mt-2 text-xs">
+                <div className="mt-2 text-xs space-y-1">
                   {fetchingAck ? (
                     <Badge variant="secondary">Checking device status...</Badge>
                   ) : ack ? (
                     settings?.pumpMode === 'manual' ? (
                       (ack.pumpMode === 'manual' && ack.pumpOn === (settings?.overridePumpOn ?? false)) ? (
-                        <Badge variant="secondary" className="bg-success/10 text-success">Command applied on device</Badge>
+                        <>
+                          <Badge variant="secondary" className="bg-success/10 text-success">Command delivered</Badge>
+                          <div className="text-muted-foreground">Last ACK: {new Date(ack.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</div>
+                        </>
                       ) : (
-                        <Badge variant="outline">Waiting for device to apply...</Badge>
+                        <>
+                          <Badge variant="outline">Waiting for device to apply...</Badge>
+                          <div className="text-muted-foreground">Last ACK: {new Date(ack.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</div>
+                        </>
                       )
                     ) : (
-                      // In auto mode, just show last ack time
-                      <Badge variant="outline">Last ACK: {new Date(ack.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</Badge>
+                      // In auto mode, show delivered and last ack time
+                      <>
+                        {commandDelivered && <Badge variant="secondary" className="bg-success/10 text-success">Command delivered</Badge>}
+                        <div className="text-muted-foreground">Last ACK: {new Date(ack.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</div>
+                      </>
                     )
                   ) : (
                     <Badge variant="outline">No device confirmation yet</Badge>
@@ -397,6 +539,10 @@ export default function Dashboard() {
               <div className="flex justify-between text-sm">
                 <span className="text-muted-foreground">ESP32 Device</span>
                 <span className="font-medium">{isError ? 'Unknown' : 'Connected'}</span>
+              </div>
+              <div className="flex justify-between text-sm">
+                <span className="text-muted-foreground">Location</span>
+                <span className="font-medium">{currentDevice?.location || '-'}</span>
               </div>
               <div className="flex justify-between text-sm">
                 <span className="text-muted-foreground">WiFi Signal</span>

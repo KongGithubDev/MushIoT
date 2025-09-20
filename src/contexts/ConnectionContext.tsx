@@ -1,6 +1,5 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { useSearchParams } from "react-router-dom";
 
 interface ConnectionState {
   online: boolean;
@@ -17,8 +16,20 @@ export const ConnectionProvider: React.FC<{ children: React.ReactNode }> = ({ ch
   const [online, setOnline] = useState<boolean>(true);
   const [checking, setChecking] = useState<boolean>(false);
   const [lastChecked, setLastChecked] = useState<Date | undefined>(undefined);
-  const [searchParams] = useSearchParams();
-  const currentDeviceId = searchParams.get('deviceId') || '';
+  const [deviceId, setDeviceId] = useState<string>('');
+  // Initialize from localStorage and keep in sync across tabs
+  useEffect(() => {
+    const init = () => {
+      const stored = localStorage.getItem('deviceId') || '';
+      setDeviceId(stored);
+    };
+    init();
+    const onStorage = (e: StorageEvent) => {
+      if (e.key === 'deviceId') setDeviceId(e.newValue || '');
+    };
+    window.addEventListener('storage', onStorage);
+    return () => window.removeEventListener('storage', onStorage);
+  }, []);
 
   const check = useCallback(async (minDurationMs: number = 0) => {
     setChecking(true);
@@ -54,13 +65,13 @@ export const ConnectionProvider: React.FC<{ children: React.ReactNode }> = ({ ch
   // Device heartbeat based on latest reading
   type Reading = { _id: string; createdAt: string };
   const { data: latestReading } = useQuery<Reading[]>({
-    queryKey: ["conn-latest-reading", currentDeviceId],
+    queryKey: ["conn-latest-reading", deviceId],
     queryFn: async () => {
-      const res = await fetch(`/api/readings?deviceId=${encodeURIComponent(currentDeviceId)}&limit=1`);
+      const res = await fetch(`/api/readings?deviceId=${encodeURIComponent(deviceId)}&limit=1`);
       if (!res.ok) throw new Error('Failed to fetch latest reading');
       return res.json();
     },
-    enabled: !!currentDeviceId && online, // only when server is online and we know device id
+    enabled: !!deviceId && online, // only when server is online and we know device id
     refetchInterval: 10000,
   });
   const deviceOnline = useMemo(() => {

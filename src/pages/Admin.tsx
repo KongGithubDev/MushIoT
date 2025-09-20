@@ -43,16 +43,68 @@ export default function Admin() {
     }
   }
 
+  async function nudgeDevice() {
+    if (!selectedId) return;
+    try {
+      const res = await fetch(`/api/admin/devices/${encodeURIComponent(selectedId)}/nudge-settings`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeader },
+      });
+      if (res.ok) {
+        const data = await res.json();
+        toast.success(`Nudged ${selectedId} (delivered=${data.delivered ?? 0})`);
+      } else {
+        toast.error(`Failed to nudge device (${res.status})`);
+      }
+    } catch (e) {
+      toast.error('Failed to nudge device');
+    }
+  }
+
+  async function applyThresholdsAll() {
+    try {
+      if (!confirm('Apply thresholds from Settings to ALL devices?')) return;
+      const res = await fetch(`/api/admin/devices/apply-thresholds`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeader },
+      });
+      if (res.ok) {
+        const data = await res.json();
+        toast.success(`Applied thresholds to all devices (modified=${data.modified ?? '-'}) low=${data.pumpOnBelow} high=${data.pumpOffAbove}`);
+      } else {
+        toast.error(`Failed to apply thresholds (${res.status})`);
+      }
+    } catch (e) {
+      toast.error('Failed to apply thresholds');
+    }
+  }
+
+  async function applySendIntervalAll() {
+    try {
+      const res = await fetch(`/api/admin/devices/apply-send-interval`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeader },
+      });
+      if (res.ok) {
+        const data = await res.json();
+        toast.success(`Applied to all devices (modified=${data.modified ?? '-'}) sendIntervalSec=${data.sendIntervalSec}s`);
+      } else {
+        toast.error(`Failed to apply send interval (${res.status})`);
+      }
+    } catch (e) {
+      toast.error('Failed to apply send interval');
+    }
+  }
+
   // ===== Device metadata editing =====
   const [name, setName] = useState("");
   const [devLocation, setDevLocation] = useState("");
-  const [tags, setTags] = useState("");
 
   useEffect(() => {
     // reset fields when device changes
     setName("");
     setDevLocation("");
-    setTags("");
+    // no tags
   }, [selectedId]);
 
   async function loadMeta() {
@@ -65,7 +117,6 @@ export default function Admin() {
       if (item) {
         setName(item.name || "");
         setDevLocation(item.location || "");
-        setTags((item.tags || []).join(", "));
       }
     } catch {}
   }
@@ -77,7 +128,6 @@ export default function Admin() {
     const body = {
       name: name || undefined,
       location: devLocation || undefined,
-      tags: tags ? tags.split(',').map(t => t.trim()).filter(Boolean) : undefined,
     };
     const res = await fetch(`/api/admin/devices/${encodeURIComponent(selectedId)}/meta`, {
       method: "PATCH",
@@ -92,23 +142,7 @@ export default function Admin() {
     }
   }
 
-  const [newId, setNewId] = useState("");
-  async function renameDevice() {
-    if (!selectedId || !newId) return;
-    const res = await fetch(`/api/admin/devices/${encodeURIComponent(selectedId)}/rename`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", ...authHeader },
-      body: JSON.stringify({ newId }),
-    });
-    if (res.ok) {
-      toast.success(`Renamed ${selectedId} -> ${newId}`);
-      setNewId("");
-      await refetch();
-      setSelectedId(newId);
-    } else {
-      toast.error(`Failed to rename (${res.status})`);
-    }
-  }
+  // rename disabled by policy
 
   const [otaVersion, setOtaVersion] = useState("");
   const [otaUrl, setOtaUrl] = useState("");
@@ -154,14 +188,34 @@ export default function Admin() {
           </div>
           <div className="flex gap-2">
             <Button onClick={revokeKey} disabled={!selectedId}>Revoke/Rotate Key</Button>
+            <Button variant="outline" onClick={nudgeDevice} disabled={!selectedId}>Nudge Settings</Button>
           </div>
-          <div className="grid gap-2">
-            <Label htmlFor="newId">Rename to</Label>
-            <div className="flex gap-2">
-              <Input id="newId" value={newId} onChange={(e) => setNewId(e.target.value)} placeholder="esp32-xyz" />
-              <Button onClick={renameDevice} disabled={!selectedId || !newId}>Rename</Button>
-            </div>
-          </div>
+          {/* rename disabled */}
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Bulk Actions</CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <Button onClick={applySendIntervalAll}>Apply Device Send Interval to All</Button>
+          <div className="text-sm text-muted-foreground">Uses System &rarr; Device Send Interval to update all devices' settings.</div>
+          <Button variant="outline" onClick={applyThresholdsAll}>Apply Thresholds to All</Button>
+          <div className="text-sm text-muted-foreground">Uses Sensors &rarr; Low/High Moisture Threshold from Settings.</div>
+          <Button variant="secondary" onClick={async () => {
+            try {
+              const res = await fetch('/api/admin/devices/nudge-all', { method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeader } });
+              if (res.ok) {
+                const data = await res.json();
+                toast.success(`Nudged all devices (delivered=${data.delivered ?? 0})`);
+              } else {
+                toast.error(`Failed to nudge all (${res.status})`);
+              }
+            } catch {
+              toast.error('Failed to nudge all');
+            }
+          }}>Nudge All Devices</Button>
         </CardContent>
       </Card>
 
@@ -197,10 +251,7 @@ export default function Admin() {
             <Label htmlFor="meta-loc">Location</Label>
             <Input id="meta-loc" value={devLocation} onChange={(e) => setDevLocation(e.target.value)} placeholder="Greenhouse A" />
           </div>
-          <div className="grid gap-2">
-            <Label htmlFor="meta-tags">Tags (comma separated)</Label>
-            <Input id="meta-tags" value={tags} onChange={(e) => setTags(e.target.value)} placeholder="oyster, rack-1" />
-          </div>
+          {/* Tags removed by request */}
           <div>
             <Button onClick={saveMeta} disabled={!selectedId}>Save Metadata</Button>
           </div>

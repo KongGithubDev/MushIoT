@@ -2,6 +2,11 @@
   "devices": {
     "esp32-8d4623": "r55u4br18mg0q2bfb35z5",
     "esp32-3aacc2": "jqs1ryh5fa5sv5qarrs3g",
-    "esp32-5adae7": "v52xwtfxp0fp4jdnzz3an9"
+    "esp32-5adae7": "v52xwtfxp0fp4jdnzz3an9",
+    "esp32-6c9cec": "2du85no5ibwt9dnjgmqfkr",
+    "esp32-5fe2a7": "n43xbj85j3u3cerdnqnzl",
+    "esp32-6a0255": "gbx77enmpch5mmtxvhdjl",
+    "esp-kong1": "rlwb3fhsql79m38kchczt",
+    "esp-kong2": "44exy123jfyts82g1vde5d"
   }
 }

@@ -30,6 +30,7 @@ import time
 from pathlib import Path
 
 import requests
+import threading
 
 STATE_FILE = Path(__file__).resolve().parent / ".tester_state.json"
 
@@ -137,6 +138,47 @@ def clamp(x, lo, hi):
     return max(lo, min(hi, x))
 
 
+def listen_sse(base_url: str, device_id: str, on_settings_cb, api_key: str | None = None, on_command_cb=None):
+    try:
+        url = f"{base_url}/api/devices/{device_id}/stream"
+        headers = {"x-api-key": api_key} if api_key else None
+        print(f"[sse] connect {url}")
+        with requests.get(url, headers=headers, stream=True, timeout=30) as r:
+            if r.status_code != 200:
+                print(f"[sse] http {r.status_code}")
+                return
+            last_event = None
+            for line in r.iter_lines(decode_unicode=True):
+                if stop_flag:
+                    break
+                if not line:
+                    continue
+                if line.startswith(":"):
+                    continue
+                if line.startswith("event:"):
+                    last_event = line.split(":",1)[1].strip()
+                    print(f"[sse] event {last_event}")
+                elif line.startswith("data:"):
+                    data = line.split(":",1)[1].strip()
+                    print(f"[sse] data {data}")
+                    if last_event == "settings":
+                        try:
+                            on_settings_cb()
+                            print("[sse] wake by settings")
+                        except Exception:
+                            pass
+                    elif last_event == "command" and on_command_cb:
+                        try:
+                            patch = json.loads(data).get("patch") if data else None
+                            if isinstance(patch, dict):
+                                print(f"[sse] apply command patch: {patch}")
+                                on_command_cb(patch)
+                        except Exception:
+                            pass
+    except Exception:
+        pass
+
+
 def main():
     p = argparse.ArgumentParser(description="Continuous ESP32 simulator")
     p.add_argument("--host", default="localhost")
@@ -176,6 +218,20 @@ def main():
     settings_applied_acked = False
 
     print(f"[run] device={device_id} interval={args.interval}s base={base_url}")
+
+    # SSE listener to nudge immediate settings fetch
+    sse_nudge = {"flag": False}
+    def on_settings():
+        sse_nudge["flag"] = True
+    # pending command patch from SSE
+    pending = {"patch": None}
+    def on_command(patch: dict):
+        pending["patch"] = patch
+        sse_nudge["flag"] = True  # wake loop immediately
+        print("[sse] loop wake due to command")
+
+    t = threading.Thread(target=listen_sse, args=(base_url, device_id, on_settings, api_key, on_command), daemon=True)
+    t.start()
     while not stop_flag:
         try:
             # Fetch settings
@@ -184,6 +240,40 @@ def main():
             override_on = bool(s.get("overridePumpOn", False))
             on_below = int(s.get("pumpOnBelow", 35))
             off_above = int(s.get("pumpOffAbove", 45))
+            send_interval = float(s.get("sendIntervalSec") or args.interval)
+
+            # Apply pending command patch instantly (from SSE)
+            if pending["patch"]:
+                p = pending["patch"]
+                pending["patch"] = None
+                if "pumpMode" in p:
+                    mode = str(p.get("pumpMode") or mode).lower()
+                if "overridePumpOn" in p:
+                    override_on = bool(p.get("overridePumpOn"))
+                if "pumpOnBelow" in p:
+                    on_below = int(p.get("pumpOnBelow") or on_below)
+                if "pumpOffAbove" in p:
+                    off_above = int(p.get("pumpOffAbove") or off_above)
+                if "sendIntervalSec" in p:
+                    try:
+                        send_interval = float(p.get("sendIntervalSec") or send_interval)
+                    except Exception:
+                        pass
+                # Post immediate ACK reflecting new desired state
+                # Compute desired pump state right now (hysteresis-aware)
+                desired_pump = pump_on
+                if mode == "manual":
+                    desired_pump = override_on
+                else:
+                    if (not pump_on) and (moisture < on_below):
+                        desired_pump = True
+                    elif pump_on and (moisture > off_above):
+                        desired_pump = False
+                # Send ACK immediately
+                post_ack(base_url, device_id, api_key, desired_pump, mode, note="cmd")
+                last_ack_state = (desired_pump, mode)
+                # Also apply desired pump locally so subsequent logic is consistent
+                pump_on = desired_pump
 
             # One-time ACK to confirm settings applied (mirrors firmware behavior)
             if not settings_applied_acked:
@@ -220,10 +310,14 @@ def main():
         except Exception as e:
             print(f"[loop] error: {e}")
 
-        # sleep
+        # sleep (respect server-provided sendIntervalSec if available)
         t0 = time.time()
-        while time.time() - t0 < args.interval:
+        while time.time() - t0 < send_interval:
             if stop_flag:
+                break
+            if sse_nudge["flag"]:
+                # immediate fetch triggered by SSE
+                sse_nudge["flag"] = False
                 break
             time.sleep(0.25)
 

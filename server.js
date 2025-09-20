@@ -99,7 +99,14 @@ app.use(helmet({
 app.use(morgan(NODE_ENV === 'production' ? 'combined' : 'dev'));
 
 // Gzip/Br compression
-app.use(compression());
+// Compression (skip SSE to avoid buffering of event stream)
+app.use(compression({
+  filter: (req, res) => {
+    const contentType = res.getHeader('Content-Type');
+    if (contentType && String(contentType).startsWith('text/event-stream')) return false;
+    return compression.filter(req, res);
+  }
+}));
 
 // JSON body parsing
 app.use(express.json({ limit: '256kb' }));
@@ -174,23 +181,58 @@ app.post('/api/admin/devices/:deviceId/revoke-key', requireAdmin, async (req, re
   }
 });
 
+// Admin: nudge a single device to fetch settings immediately via SSE
+app.post('/api/admin/devices/:deviceId/nudge-settings', requireAdmin, async (req, res) => {
+  try {
+    const { deviceId } = req.params;
+    const sent = sseSend(deviceId, 'settings', { reason: 'admin-nudge' });
+    res.json({ success: true, delivered: sent });
+  } catch (e) {
+    console.error('POST /api/admin/devices/:deviceId/nudge-settings error:', e);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
+// Admin: apply device send interval (from App Settings) to all devices
+app.post('/api/admin/devices/apply-send-interval', requireAdmin, async (req, res) => {
+  try {
+    const app = await getAppSettings();
+    const sec = Number(app?.system?.deviceSendIntervalSec);
+    if (!Number.isFinite(sec) || sec <= 0) return res.status(400).json({ error: 'deviceSendIntervalSec not set in App Settings' });
+    const r = await DeviceSettings.updateMany({}, { $set: { sendIntervalSec: sec } });
+    // Nudge all connected devices to fetch settings now
+    sseBroadcast('settings', { reason: 'apply-send-interval' });
+    res.json({ success: true, matched: r.matchedCount || r.n, modified: r.modifiedCount || r.nModified, sendIntervalSec: sec });
+  } catch (e) {
+    console.error('POST /api/admin/devices/apply-send-interval error:', e);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
+// Admin: apply device thresholds (from App Settings) to all devices
+app.post('/api/admin/devices/apply-thresholds', requireAdmin, async (req, res) => {
+  try {
+    const app = await getAppSettings();
+    const low = Number(app?.sensors?.moistureThresholdLow);
+    const high = Number(app?.sensors?.moistureThresholdHigh);
+    const update = {};
+    if (Number.isFinite(low)) update.pumpOnBelow = low;
+    if (Number.isFinite(high)) update.pumpOffAbove = high;
+    if (Object.keys(update).length === 0) return res.status(400).json({ error: 'thresholds not set in App Settings' });
+    const r = await DeviceSettings.updateMany({}, { $set: update });
+    // Nudge all connected devices to fetch settings now
+    sseBroadcast('settings', { reason: 'apply-thresholds' });
+    res.json({ success: true, matched: r.matchedCount || r.n, modified: r.modifiedCount || r.nModified, pumpOnBelow: low, pumpOffAbove: high });
+  } catch (e) {
+    console.error('POST /api/admin/devices/apply-thresholds error:', e);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
 // Rename a device across collections (admin)
 app.post('/api/admin/devices/:deviceId/rename', requireAdmin, async (req, res) => {
   try {
-    const { deviceId } = req.params;
-    const { newId } = req.body || {};
-    if (!newId || typeof newId !== 'string') return res.status(400).json({ error: 'newId required' });
-    // Update DeviceSettings
-    await DeviceSettings.updateMany({ deviceId }, { $set: { deviceId: newId } });
-    // Update other collections
-    const updates = await Promise.all([
-      Reading.updateMany({ deviceId }, { $set: { deviceId: newId } }),
-      Ack.updateMany({ deviceId }, { $set: { deviceId: newId } }),
-      WateringEvent.updateMany({ deviceId }, { $set: { deviceId: newId } }),
-      Alert.updateMany({ deviceId }, { $set: { deviceId: newId } }),
-      Schedule.updateMany({ deviceId }, { $set: { deviceId: newId } }),
-    ]);
-    res.json({ oldId: deviceId, newId, updated: updates.map(u => u.modifiedCount) });
+    return res.status(501).json({ error: 'Device rename is disabled by policy' });
   } catch (e) {
     console.error('POST /api/admin/devices/:deviceId/rename error:', e);
     res.status(500).json({ error: 'Internal Server Error' });
@@ -208,6 +250,8 @@ const appSettingsSchema = new mongoose.Schema(
       dataRetention: Number,
       darkMode: Boolean,
       language: String,
+      deviceSendIntervalSec: Number,
+      dashboardRefreshSec: Number,
     },
     ota: {
       version: String,
@@ -613,12 +657,109 @@ const deviceSettingsSchema = new mongoose.Schema(
     overridePumpOn: { type: Boolean, default: false },
     pumpOnBelow: { type: Number, default: 35 },
     pumpOffAbove: { type: Number, default: 45 },
+    sendIntervalSec: { type: Number },
     apiKey: { type: String, default: () => Math.random().toString(36).slice(2) },
   },
   { timestamps: true }
 );
 
 const DeviceSettings = mongoose.models.DeviceSettings || mongoose.model('DeviceSettings', deviceSettingsSchema);
+
+// ===== Simple in-memory SSE hub (per-device) =====
+const sseClients = new Map(); // deviceId -> Set<res>
+function sseAddClient(deviceId, res) {
+  if (!sseClients.has(deviceId)) sseClients.set(deviceId, new Set());
+  sseClients.get(deviceId).add(res);
+}
+function sseRemoveClient(deviceId, res) {
+  const set = sseClients.get(deviceId);
+  if (!set) return;
+  set.delete(res);
+  if (set.size === 0) sseClients.delete(deviceId);
+}
+function sseSend(deviceId, eventName, data) {
+  const set = sseClients.get(deviceId);
+  if (!set) return 0;
+  const payload = `event: ${eventName}\n` + (data ? `data: ${JSON.stringify(data)}\n` : '') + `\n`;
+  let count = 0;
+  for (const res of set) {
+    try { res.write(payload); count++; } catch {}
+  }
+  return count;
+}
+
+function sseBroadcast(eventName, data) {
+  let total = 0;
+  for (const [deviceId, set] of sseClients.entries()) {
+    total += sseSend(deviceId, eventName, data);
+  }
+  return total;
+}
+
+// ===== UI SSE hub (broadcast to all dashboard clients) =====
+const uiSseClients = new Set(); // Set<res>
+function uiSseAdd(res) { uiSseClients.add(res); }
+function uiSseRemove(res) { uiSseClients.delete(res); }
+function uiSseSend(eventName, data) {
+  const payload = `event: ${eventName}\n` + (data ? `data: ${JSON.stringify(data)}\n` : '') + `\n`;
+  let count = 0;
+  for (const res of uiSseClients) {
+    try { res.write(payload); count++; } catch {}
+  }
+  return count;
+}
+
+// Public UI stream (no auth; CORS handled by app)
+app.get('/api/stream', async (req, res) => {
+  try {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.setHeader('Content-Encoding', 'identity');
+    req.socket?.setNoDelay?.(true);
+    res.flushHeaders?.();
+    res.write(`: ui connected ${new Date().toISOString()}\n\n`);
+    uiSseAdd(res);
+    const ping = setInterval(() => { try { res.write(`: ping ${Date.now()}\n\n`); } catch {} }, 25000);
+    req.on('close', () => {
+      clearInterval(ping);
+      uiSseRemove(res);
+      try { res.end(); } catch {}
+    });
+  } catch (e) {
+    try { res.status(500).end(); } catch {}
+  }
+});
+
+// Device SSE stream (secured by device API key unless DISABLE_DEVICE_AUTH=true)
+app.get('/api/devices/:deviceId/stream', requireApiKey, async (req, res) => {
+  try {
+    const { deviceId } = req.params;
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    // Prevent proxy/server buffering
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.setHeader('Content-Encoding', 'identity');
+    req.socket?.setNoDelay?.(true);
+    res.flushHeaders?.();
+    // Initial comment/hello
+    res.write(`: connected ${new Date().toISOString()}\n\n`);
+    sseAddClient(deviceId, res);
+    // Keepalive ping
+    const ping = setInterval(() => {
+      try { res.write(`: ping ${Date.now()}\n\n`); } catch {}
+    }, 25000);
+    req.on('close', () => {
+      clearInterval(ping);
+      sseRemoveClient(deviceId, res);
+      try { res.end(); } catch {}
+    });
+  } catch (e) {
+    try { res.status(500).end(); } catch {}
+  }
+});
 
 async function getOrCreateSettings(deviceId) {
   let s = await DeviceSettings.findOne({ deviceId });
@@ -629,8 +770,10 @@ async function getOrCreateSettings(deviceId) {
       const app = await getAppSettings();
       const low = Number(app?.sensors?.moistureThresholdLow);
       const high = Number(app?.sensors?.moistureThresholdHigh);
+      const devSend = Number(app?.system?.deviceSendIntervalSec);
       if (Number.isFinite(low)) seed.pumpOnBelow = low;
       if (Number.isFinite(high)) seed.pumpOffAbove = high;
+      if (Number.isFinite(devSend)) seed.sendIntervalSec = devSend;
     } catch {}
     s = await DeviceSettings.create({ deviceId, ...seed });
   }
@@ -640,6 +783,10 @@ async function getOrCreateSettings(deviceId) {
 // API key middleware for device-origin requests
 async function requireApiKey(req, res, next) {
   try {
+    // Dev bypass: set DISABLE_DEVICE_AUTH=true to skip API key validation (use only in development!)
+    if (String(process.env.DISABLE_DEVICE_AUTH || 'false').toLowerCase() === 'true') {
+      return next();
+    }
     const deviceId = req.params.deviceId || req.body?.deviceId || req.query?.deviceId;
     if (!deviceId) return res.status(400).json({ error: 'deviceId is required' });
     const key = req.header('x-api-key');
@@ -662,6 +809,7 @@ app.post('/api/readings', requireApiKey, async (req, res) => {
     // Upsert device lastSeen
     try { await Device.updateOne({ deviceId }, { $set: { lastSeen: now } }, { upsert: true }); } catch {}
     const doc = await Reading.create({ deviceId, temperature, humidity, co2, moisture, payload });
+    try { uiSseSend('reading', { deviceId, moisture, at: doc.createdAt, payload }); } catch {}
     return res.status(201).json({ success: true, id: doc._id });
   } catch (err) {
     console.error('POST /api/readings error:', err);
@@ -697,6 +845,7 @@ app.post('/api/devices/:deviceId/ack', requireApiKey, async (req, res) => {
     const now = new Date();
     try { await Device.updateOne({ deviceId }, { $set: { lastSeen: now } }, { upsert: true }); } catch {}
     const doc = await Ack.create({ deviceId, pumpOn, pumpMode, note });
+    try { uiSseSend('ack', { deviceId, pumpOn, pumpMode, at: doc.createdAt, note }); } catch {}
     // Record watering event transitions
     await handleAckForEvents(deviceId, pumpOn, pumpMode);
     return res.status(201).json({ success: true, id: doc._id });
@@ -860,7 +1009,7 @@ app.get('/api/devices/:deviceId/settings', async (req, res) => {
 app.patch('/api/devices/:deviceId/settings', async (req, res) => {
   try {
     const { deviceId } = req.params;
-    const allowed = ['pumpMode', 'overridePumpOn', 'pumpOnBelow', 'pumpOffAbove'];
+    const allowed = ['pumpMode', 'overridePumpOn', 'pumpOnBelow', 'pumpOffAbove', 'sendIntervalSec'];
     const update = {};
     for (const k of allowed) {
       if (k in req.body) update[k] = req.body[k];
@@ -870,6 +1019,9 @@ app.patch('/api/devices/:deviceId/settings', async (req, res) => {
       { $set: update },
       { new: true, upsert: true }
     );
+    try { sseSend(deviceId, 'settings', { reason: 'device-settings-changed', changed: Object.keys(update) }); } catch {}
+    try { uiSseSend('settings', { deviceId, changed: Object.keys(update), at: new Date() }); } catch {}
+    try { sseSend(deviceId, 'command', { patch: update }); } catch {}
     return res.json(s);
   } catch (err) {
     console.error('PATCH /api/devices/:deviceId/settings error:', err);

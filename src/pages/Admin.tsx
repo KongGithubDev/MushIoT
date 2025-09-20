@@ -12,19 +12,20 @@ export default function Admin() {
   const { token, user } = useAuth();
   const isAdmin = user?.role === "admin";
 
-  const { data: deviceIds, refetch } = useQuery<string[]>({
-    queryKey: ["devices"],
+  type DeviceItem = { deviceId: string; name?: string; online?: boolean };
+  const { data: registry, refetch } = useQuery<DeviceItem[]>({
+    queryKey: ["devices", "registry"],
     queryFn: async () => {
-      const res = await fetch("/api/devices");
-      if (!res.ok) throw new Error("Failed to fetch devices");
+      const res = await fetch("/api/devices/registry");
+      if (!res.ok) throw new Error("Failed to fetch device registry");
       return res.json();
     },
   });
 
   const [selectedId, setSelectedId] = useState<string>("");
   useEffect(() => {
-    if (!selectedId && deviceIds && deviceIds.length > 0) setSelectedId(deviceIds[0]);
-  }, [deviceIds, selectedId]);
+    if (!selectedId && registry && registry.length > 0) setSelectedId(registry[0].deviceId);
+  }, [registry, selectedId]);
 
   const authHeader = useMemo(() => (token ? { Authorization: `Bearer ${token}` } : {}), [token]);
 
@@ -39,6 +40,55 @@ export default function Admin() {
       toast.success(`New key issued for ${data.deviceId}`);
     } else {
       toast.error(`Failed to revoke key (${res.status})`);
+    }
+  }
+
+  // ===== Device metadata editing =====
+  const [name, setName] = useState("");
+  const [devLocation, setDevLocation] = useState("");
+  const [tags, setTags] = useState("");
+
+  useEffect(() => {
+    // reset fields when device changes
+    setName("");
+    setDevLocation("");
+    setTags("");
+  }, [selectedId]);
+
+  async function loadMeta() {
+    if (!selectedId) return;
+    try {
+      const res = await fetch(`/api/devices/registry`);
+      if (!res.ok) return;
+      const list = await res.json();
+      const item = list.find((x: any) => x.deviceId === selectedId);
+      if (item) {
+        setName(item.name || "");
+        setDevLocation(item.location || "");
+        setTags((item.tags || []).join(", "));
+      }
+    } catch {}
+  }
+
+  useEffect(() => { loadMeta(); }, [selectedId]);
+
+  async function saveMeta() {
+    if (!selectedId) return;
+    const body = {
+      name: name || undefined,
+      location: devLocation || undefined,
+      tags: tags ? tags.split(',').map(t => t.trim()).filter(Boolean) : undefined,
+    };
+    const res = await fetch(`/api/admin/devices/${encodeURIComponent(selectedId)}/meta`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json", ...authHeader },
+      body: JSON.stringify(body),
+    });
+    if (res.ok) {
+      toast.success("Metadata saved");
+      await refetch();
+    } else {
+      toast.error(`Failed to save metadata (${res.status})`);
     }
   }
 
@@ -83,7 +133,7 @@ export default function Admin() {
   }
 
   return (
-    <div className="p-6 grid gap-6 grid-cols-1 lg:grid-cols-2">
+    <div className="p-6 grid gap-6 grid-cols-1 lg:grid-cols-3">
       <Card>
         <CardHeader>
           <CardTitle>Device Management</CardTitle>
@@ -96,8 +146,8 @@ export default function Admin() {
                 <SelectValue placeholder="Select device" />
               </SelectTrigger>
               <SelectContent>
-                {deviceIds?.map((id) => (
-                  <SelectItem key={id} value={id}>{id}</SelectItem>
+                {(registry || []).map((d) => (
+                  <SelectItem key={d.deviceId} value={d.deviceId}>{d.name || d.deviceId}{d.online ? ' • Online' : ''}</SelectItem>
                 ))}
               </SelectContent>
             </Select>
@@ -130,6 +180,29 @@ export default function Admin() {
           </div>
           <div>
             <Button onClick={updateOta}>Save OTA</Button>
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Device Metadata</CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="grid gap-2">
+            <Label htmlFor="meta-name">Name</Label>
+            <Input id="meta-name" value={name} onChange={(e) => setName(e.target.value)} placeholder="Friendly name" />
+          </div>
+          <div className="grid gap-2">
+            <Label htmlFor="meta-loc">Location</Label>
+            <Input id="meta-loc" value={devLocation} onChange={(e) => setDevLocation(e.target.value)} placeholder="Greenhouse A" />
+          </div>
+          <div className="grid gap-2">
+            <Label htmlFor="meta-tags">Tags (comma separated)</Label>
+            <Input id="meta-tags" value={tags} onChange={(e) => setTags(e.target.value)} placeholder="oyster, rack-1" />
+          </div>
+          <div>
+            <Button onClick={saveMeta} disabled={!selectedId}>Save Metadata</Button>
           </div>
         </CardContent>
       </Card>

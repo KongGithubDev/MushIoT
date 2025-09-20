@@ -84,6 +84,8 @@ const ADMIN_EMAIL = process.env.ADMIN_EMAIL || '';
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
 const FIRMWARE_VERSION = process.env.FIRMWARE_VERSION || '';
 const FIRMWARE_URL = process.env.FIRMWARE_URL || '';
+const USE_DB_USERS = String(process.env.USE_DB_USERS || 'false').toLowerCase() === 'true';
+const DATA_RETENTION_DAYS = Number(process.env.DATA_RETENTION_DAYS || 0);
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
 const RATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS || 60_000);
 const RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_MAX || 120);
@@ -91,7 +93,8 @@ const RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_MAX || 120);
 // security & logging
 app.set('trust proxy', 1); // respect X-Forwarded-* headers (for proxies/load balancers)
 app.use(helmet({
-  contentSecurityPolicy: false, // adjust if you add inline scripts
+  contentSecurityPolicy: false, // disabled due to inline styles from UI lib; enable/adjust in future
+  hsts: NODE_ENV === 'production' ? undefined : false,
 }));
 app.use(morgan(NODE_ENV === 'production' ? 'combined' : 'dev'));
 
@@ -110,16 +113,24 @@ const corsOptions = {
     return callback(new Error('Not allowed by CORS'));
   },
   credentials: true,
+  methods: ['GET','POST','PATCH','DELETE','OPTIONS'],
 };
 app.use(cors(corsOptions));
 
-// Basic rate limiting for API routes
-const apiLimiter = rateLimit({
-  windowMs: RATE_LIMIT_WINDOW_MS,
-  max: RATE_LIMIT_MAX,
-  standardHeaders: true,
-  legacyHeaders: false,
-});
+// Basic rate limiting for API routes (production only unless explicitly enabled)
+let apiLimiter;
+if (NODE_ENV === 'production' && RATE_LIMIT_MAX > 0) {
+  apiLimiter = rateLimit({
+    windowMs: RATE_LIMIT_WINDOW_MS,
+    max: RATE_LIMIT_MAX,
+    standardHeaders: true,
+    legacyHeaders: false,
+    // Custom handler: return 429 with no body to avoid noisy message
+    handler: (req, res, next, options) => {
+      res.status(options.statusCode || 429).end();
+    },
+  });
+}
 
 // ===== Admin utilities (protected by ADMIN_TOKEN) =====
 function requireAdmin(req, res, next) {
@@ -255,12 +266,41 @@ app.patch('/api/app-settings', async (req, res) => {
     const allowed = ['system', 'connection', 'sensors', 'notifications', 'account'];
     for (const k of allowed) if (k in req.body) update[k] = req.body[k];
     const doc = await AppSettings.findOneAndUpdate({ _id: 'global' }, { $set: update }, { new: true, upsert: true });
+    // Dynamically adjust TTL according to system.dataRetention (days)
+    const days = Number(doc?.system?.dataRetention || 0);
+    if (Number.isFinite(days) && days > 0) {
+      try { await updateTtlIndexes(days); } catch (e) { console.warn('TTL update failed:', e?.message || e); }
+    }
     res.json(doc);
   } catch (e) {
     console.error('PATCH /api/app-settings error:', e);
     res.status(500).json({ error: 'Internal Server Error' });
   }
 });
+
+// Update TTL indexes for time-series collections according to retention days
+async function updateTtlIndexes(days) {
+  const secs = Math.max(1, Math.floor(days * 86400));
+  if (!mongoose.connection?.db) return;
+  const db = mongoose.connection.db;
+  const targets = [Reading, Ack, WateringEvent];
+  for (const model of targets) {
+    try {
+      const coll = model.collection.collectionName;
+      // try collMod; if index missing, create it
+      try {
+        await db.command({ collMod: coll, index: { name: 'createdAt_1', expireAfterSeconds: secs } });
+        console.log(`[ttl] updated ${coll}.createdAt_1 -> ${secs}s`);
+      } catch (e) {
+        // Ensure index exists with TTL
+        await db.collection(coll).createIndex({ createdAt: 1 }, { name: 'createdAt_1', expireAfterSeconds: secs });
+        console.log(`[ttl] created ${coll}.createdAt_1 -> ${secs}s`);
+      }
+    } catch (e) {
+      console.warn('[ttl] error for model', model?.modelName, e?.message || e);
+    }
+  }
+}
 
 // Moisture history aggregation per day (avg/min/max)
 app.get('/api/history/moisture', async (req, res) => {
@@ -449,11 +489,21 @@ app.post('/api/alerts/mark-all-read', async (req, res) => {
     res.status(500).json({ error: 'Internal Server Error' });
   }
 });
-app.use('/api', apiLimiter);
+if (apiLimiter) {
+  app.use('/api', apiLimiter);
+}
 
 // Health check
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', time: new Date().toISOString() });
+  const dbState = mongoose.connection?.readyState;
+  const dbConnected = dbState === 1; // 1 connected, 2 connecting, 0 disconnected
+  res.json({
+    status: 'ok',
+    time: new Date().toISOString(),
+    nodeEnv: NODE_ENV,
+    dbConnected,
+    uptimeSec: Math.round(process.uptime()),
+  });
 });
 
 // OTA manifest (simple global manifest; could be extended per device)
@@ -489,12 +539,21 @@ app.post('/api/auth/login', async (req, res) => {
     if (!JWT_SECRET) return res.status(501).json({ error: 'auth not configured' });
     const { email, password } = req.body || {};
     if (!email || !password) return res.status(400).json({ error: 'email and password required' });
-    const u = await User.findOne({ email });
-    if (!u) return res.status(401).json({ error: 'invalid credentials' });
-    const ok = u.passwordHash === sha256(password);
-    if (!ok) return res.status(401).json({ error: 'invalid credentials' });
-    const token = signJwt({ sub: u._id.toString(), email: u.email, role: u.role }, JWT_SECRET, 24*3600);
-    res.json({ token, user: { email: u.email, role: u.role } });
+    if (!USE_DB_USERS) {
+      // Env-based admin login only
+      if (ADMIN_EMAIL && ADMIN_PASSWORD && email === ADMIN_EMAIL && password === ADMIN_PASSWORD) {
+        const token = signJwt({ sub: 'admin', email: ADMIN_EMAIL, role: 'admin' }, JWT_SECRET, 24*3600);
+        return res.json({ token, user: { email: ADMIN_EMAIL, role: 'admin' } });
+      }
+      return res.status(401).json({ error: 'invalid credentials' });
+    } else {
+      const u = await User.findOne({ email });
+      if (!u) return res.status(401).json({ error: 'invalid credentials' });
+      const ok = u.passwordHash === sha256(password);
+      if (!ok) return res.status(401).json({ error: 'invalid credentials' });
+      const token = signJwt({ sub: u._id.toString(), email: u.email, role: u.role }, JWT_SECRET, 24*3600);
+      return res.json({ token, user: { email: u.email, role: u.role } });
+    }
   } catch (e) {
     console.error('POST /api/auth/login error:', e);
     res.status(500).json({ error: 'Internal Server Error' });
@@ -503,14 +562,30 @@ app.post('/api/auth/login', async (req, res) => {
 
 app.get('/api/auth/me', requireAuth, async (req, res) => {
   try {
+    // For env-based auth, just echo from token
+    if (!USE_DB_USERS) return res.json({ email: req.user.email, role: req.user.role });
+    // DB-backed users
     const u = await User.findById(req.user.sub).select('email role');
-    res.json(u);
+    if (!u) return res.json({ email: req.user.email, role: req.user.role });
+    return res.json(u);
   } catch (e) {
     res.status(500).json({ error: 'Internal Server Error' });
   }
 });
 
 // MongoDB connection and schema
+// Devices registry (metadata and online status)
+const deviceSchema = new mongoose.Schema(
+  {
+    deviceId: { type: String, required: true, unique: true, index: true },
+    name: { type: String },
+    location: { type: String },
+    tags: { type: [String], default: [] },
+    lastSeen: { type: Date },
+  },
+  { timestamps: true }
+);
+const Device = mongoose.models.Device || mongoose.model('Device', deviceSchema);
 const readingSchema = new mongoose.Schema(
   {
     deviceId: { type: String, required: true, index: true },
@@ -522,6 +597,11 @@ const readingSchema = new mongoose.Schema(
   },
   { timestamps: true }
 );
+
+// TTL index for readings (optional)
+if (DATA_RETENTION_DAYS > 0) {
+  readingSchema.index({ createdAt: 1 }, { expireAfterSeconds: DATA_RETENTION_DAYS * 86400 });
+}
 
 const Reading = mongoose.models.Reading || mongoose.model('Reading', readingSchema);
 
@@ -543,7 +623,16 @@ const DeviceSettings = mongoose.models.DeviceSettings || mongoose.model('DeviceS
 async function getOrCreateSettings(deviceId) {
   let s = await DeviceSettings.findOne({ deviceId });
   if (!s) {
-    s = await DeviceSettings.create({ deviceId });
+    // Seed defaults from App Settings (sensors) if available
+    let seed = {};
+    try {
+      const app = await getAppSettings();
+      const low = Number(app?.sensors?.moistureThresholdLow);
+      const high = Number(app?.sensors?.moistureThresholdHigh);
+      if (Number.isFinite(low)) seed.pumpOnBelow = low;
+      if (Number.isFinite(high)) seed.pumpOffAbove = high;
+    } catch {}
+    s = await DeviceSettings.create({ deviceId, ...seed });
   }
   return s;
 }
@@ -569,6 +658,9 @@ app.post('/api/readings', requireApiKey, async (req, res) => {
   try {
     const { deviceId, temperature, humidity, co2, moisture, payload } = req.body || {};
     if (!deviceId) return res.status(400).json({ error: 'deviceId is required' });
+    const now = new Date();
+    // Upsert device lastSeen
+    try { await Device.updateOne({ deviceId }, { $set: { lastSeen: now } }, { upsert: true }); } catch {}
     const doc = await Reading.create({ deviceId, temperature, humidity, co2, moisture, payload });
     return res.status(201).json({ success: true, id: doc._id });
   } catch (err) {
@@ -589,6 +681,11 @@ const ackSchema = new mongoose.Schema(
 );
 const Ack = mongoose.models.Ack || mongoose.model('Ack', ackSchema);
 
+// TTL index for acks (optional)
+if (DATA_RETENTION_DAYS > 0) {
+  ackSchema.index({ createdAt: 1 }, { expireAfterSeconds: DATA_RETENTION_DAYS * 86400 });
+}
+
 // POST ack from device
 app.post('/api/devices/:deviceId/ack', requireApiKey, async (req, res) => {
   try {
@@ -597,6 +694,8 @@ app.post('/api/devices/:deviceId/ack', requireApiKey, async (req, res) => {
     if (typeof pumpOn !== 'boolean' || (pumpMode !== 'auto' && pumpMode !== 'manual')) {
       return res.status(400).json({ error: 'pumpOn (boolean) and pumpMode (auto|manual) are required' });
     }
+    const now = new Date();
+    try { await Device.updateOne({ deviceId }, { $set: { lastSeen: now } }, { upsert: true }); } catch {}
     const doc = await Ack.create({ deviceId, pumpOn, pumpMode, note });
     // Record watering event transitions
     await handleAckForEvents(deviceId, pumpOn, pumpMode);
@@ -630,6 +729,11 @@ const wateringEventSchema = new mongoose.Schema(
   { timestamps: true }
 );
 const WateringEvent = mongoose.models.WateringEvent || mongoose.model('WateringEvent', wateringEventSchema);
+
+// TTL index for watering events (optional)
+if (DATA_RETENTION_DAYS > 0) {
+  wateringEventSchema.index({ createdAt: 1 }, { expireAfterSeconds: DATA_RETENTION_DAYS * 86400 });
+}
 
 // Helper: create/close events on ack
 async function handleAckForEvents(deviceId, pumpOn, pumpMode) {
@@ -682,13 +786,61 @@ app.get('/api/readings', async (req, res) => {
 // List devices (by distinct deviceId from readings and settings)
 app.get('/api/devices', async (req, res) => {
   try {
-    const fromReadings = await Reading.distinct('deviceId');
-    const fromSettings = await DeviceSettings.distinct('deviceId');
-    const ids = Array.from(new Set([...fromReadings, ...fromSettings]));
-    return res.json(ids);
+    // Return device IDs based on Device registry only, mirroring /api/devices/registry
+    if (!mongoose.connection || mongoose.connection.readyState !== 1) {
+      return res.json([]);
+    }
+    const docs = await Device.find({}, { deviceId: 1, _id: 0 }).sort({ updatedAt: -1 }).lean();
+    return res.json(docs.map(d => d.deviceId));
   } catch (err) {
     console.error('GET /api/devices error:', err);
     return res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
+// Devices registry with metadata and online flag
+app.get('/api/devices/registry', async (req, res) => {
+  try {
+    // If DB not connected, return empty list gracefully (dev without DB)
+    if (!mongoose.connection || mongoose.connection.readyState !== 1) {
+      return res.json([]);
+    }
+    const docs = await Device.find({}).sort({ updatedAt: -1 }).lean();
+    const now = Date.now();
+    // Dynamic online window from App Settings: 2x syncInterval (seconds), min 30s
+    let onlineWindowMs = 30_000;
+    try {
+      const app = await getAppSettings();
+      const syncIntervalSec = Number(app?.system?.syncInterval) || 60;
+      onlineWindowMs = Math.max(30, syncIntervalSec * 2) * 1000;
+    } catch {}
+    const items = docs.map(d => ({
+      deviceId: d.deviceId,
+      name: d.name || d.deviceId,
+      location: d.location || null,
+      tags: d.tags || [],
+      lastSeen: d.lastSeen || null,
+      online: d.lastSeen ? (now - new Date(d.lastSeen).getTime() <= onlineWindowMs) : false,
+    }));
+    return res.json(items);
+  } catch (e) {
+    console.error('GET /api/devices/registry error:', e);
+    return res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
+// Admin: update device metadata
+app.patch('/api/admin/devices/:deviceId/meta', requireAdmin, async (req, res) => {
+  try {
+    const { deviceId } = req.params;
+    const allowed = ['name', 'location', 'tags'];
+    const update = {};
+    for (const k of allowed) if (k in req.body) update[k] = req.body[k];
+    const doc = await Device.findOneAndUpdate({ deviceId }, { $set: update }, { new: true, upsert: true });
+    res.json(doc);
+  } catch (e) {
+    console.error('PATCH /api/admin/devices/:deviceId/meta error:', e);
+    res.status(500).json({ error: 'Internal Server Error' });
   }
 });
 
@@ -764,8 +916,8 @@ async function start() {
     } else {
       await mongoose.connect(MONGODB_URI, { dbName: process.env.MONGODB_DB || undefined });
       console.log('Connected to MongoDB');
-      // Seed admin user
-      if (ADMIN_EMAIL && ADMIN_PASSWORD) {
+      // Seed admin user only when using DB users
+      if (USE_DB_USERS && ADMIN_EMAIL && ADMIN_PASSWORD) {
         const exists = await User.findOne({ email: ADMIN_EMAIL });
         if (!exists) {
           await User.create({ email: ADMIN_EMAIL, passwordHash: sha256(ADMIN_PASSWORD), role: 'admin' });

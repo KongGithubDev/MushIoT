@@ -24,7 +24,7 @@ A production-ready IoT web app to monitor and control mushroom cultivation soil 
 ```
 
 ## Features
-- Live device readings with polling (5s)
+- Live device readings with polling (60s by default; manual refresh available)
 - Global device selection (persisted in URL `?deviceId=`)
 - Pump control modes:
   - Auto: moisture hysteresis (onBelow/offAbove)
@@ -113,7 +113,10 @@ Once deployed, verify health at: `https://<your-service>.onrender.com/api/health
 - GET `/api/readings?deviceId=esp32-001&limit=50`
   - Returns sorted newest-first
 - GET `/api/devices`
-  - Returns distinct device IDs
+  - Returns device IDs from Device registry (empty when DB is disconnected)
+  
+- GET `/api/devices/registry`
+  - Returns device entries with metadata and `online` flag
 - GET `/api/devices/:deviceId/settings`
   - Returns persisted settings: `{ deviceId, pumpMode, overridePumpOn, pumpOnBelow, pumpOffAbove }`
 - PATCH `/api/devices/:deviceId/settings`
@@ -172,14 +175,14 @@ Once deployed, verify health at: `https://<your-service>.onrender.com/api/health
 - Behavior
   - Poll settings every 3s: `GET /api/devices/<id>/settings`
     - Auto -> uses hysteresis; Manual -> overrides relay by `overridePumpOn`
-  - Send readings every 10s: `POST /api/readings`
+  - Send readings every 60s: `POST /api/readings`
   - Send ACK on state change or after applying settings: `POST /api/devices/<id>/ack`
   - Auto-provisioning retries in loop if initial key request fails.
   - LCD shows moisture and pump state, or "Not connected" on WiFi loss
 
 ## Frontend
 - Dashboard (`src/pages/Dashboard.tsx`):
-  - Live readings chart, current moisture
+  - Live readings chart (auto refresh 60s), current moisture
   - Pump mode toggle (Auto/Manual) and Start/Stop button
   - Shows device ACK confirmation ("Command applied on device") when Manual override matches device state
 - Alerts (`src/pages/Alerts.tsx`): loads from DB, mark read/dismiss, mark-all-read
@@ -190,24 +193,11 @@ Once deployed, verify health at: `https://<your-service>.onrender.com/api/health
   - Weekly summary computed from aggregation results
 - Settings (`src/pages/Settings.tsx`): App Settings load/save via `/api/app-settings`
 
-## Wiring (Summary)
-- Soil Sensor: `VCC->3.3V`, `GND->GND`, `AOUT->GPIO34`
-- Relay: `VCC->5V`, `GND->GND`, `IN1->GPIO25` (LOW=ON)
-- Pump: `12V+ -> Pump+`, `Pump- -> Relay NO`, `Relay COM -> 12V-`
-- Diode: 1N4007 across pump terminals (stripe to +)
-- LCD I2C: `VCC->3.3V` (or 5V if needed), `GND->GND`, `SDA->21`, `SCL->22`
-
-## Notes & Safety
-- Do not power ESP32 from 12V.
-- Ensure flyback diode installed across the pump.
-- If relay triggers unreliably with 3.3V logic, use a 3.3V-compatible relay or a transistor driver.
-- TLS note: the firmware uses `WiFiClientSecure.setInsecure()` to simplify HTTPS. For production hardening, load a CA cert via `setCACert(...)`.
-
 ## Multi-Device Setup (Production)
 - Flash the same firmware to all ESP32s.
 - Each device uses `DEVICE_ID="auto"` and provisions its own API key on first boot.
 - Rename devices if desired by updating `deviceId` via database or by re-flashing with a fixed `DEVICE_ID`.
-- The web app lists all devices from `GET /api/devices`; pick a device from the selector in the header.
+  - The web app lists all devices from the device registry; pick a device from the selector in the header.
 
 ## Operations
 - Rotate a device key (e.g., if compromised): `POST /api/devices/<id>/rotate-key`.
@@ -217,7 +207,11 @@ Once deployed, verify health at: `https://<your-service>.onrender.com/api/health
 
 ## Troubleshooting
 - Device shows Offline but Server Online:
-  - Ensure ESP32 posts a reading at least once every 30s (configurable window)
+  - Ensure ESP32 posts a reading within the online window (default 30s). If the device interval is longer, increase the window in the server.
+
+## Simulator Notes
+- `Tester/sim_device.py` simulates device behavior with auto/manual modes and hysteresis.
+- Default send interval is 60s. For stress or real-time testing, run with `--interval 1`.
 - 401/403 on device POSTs:
   - Make sure `x-api-key` header matches server’s rotated key for the `DEVICE_ID`
 - CORS errors in browser:

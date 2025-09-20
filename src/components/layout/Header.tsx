@@ -21,44 +21,69 @@ export function Header({ onMenuClick }: HeaderProps) {
   const currentDeviceId = searchParams.get('deviceId') || '';
   const { user, logout } = useAuth();
 
-  const { data: deviceIds } = useQuery<string[]>({
-    queryKey: ["devices"],
+  type DeviceItem = { deviceId: string; name: string; online: boolean };
+  const { data: devices, error: devicesError, isLoading: devicesLoading } = useQuery<DeviceItem[]>({
+    queryKey: ["devices", "registry"],
     queryFn: async () => {
-      const res = await fetch('/api/devices');
-      if (!res.ok) throw new Error('Failed to fetch devices');
+      const res = await fetch('/api/devices/registry');
+      if (!res.ok) throw new Error('Failed to fetch device registry');
       return res.json();
     },
     refetchInterval: 15000,
   });
 
-  // Device heartbeat via latest reading
+  // Device heartbeat via latest reading (fallback when registry info unavailable)
   type Reading = { _id: string; createdAt: string };
+  const selectedFromRegistry = (devices || []).find(d => d.deviceId === currentDeviceId) || (devices && devices[0]);
+  const effectiveDeviceId = currentDeviceId || selectedFromRegistry?.deviceId || '';
+  const selectedLabel = (() => {
+    const d = (devices || []).find(x => x.deviceId === effectiveDeviceId);
+    if (d) return `${d.name || d.deviceId}${d.online ? ' • Online' : ''}`;
+    return effectiveDeviceId || 'Select device';
+  })();
   const { data: latestReading } = useQuery<Reading[]>({
-    queryKey: ["header-latest-reading", currentDeviceId],
+    queryKey: ["header-latest-reading", effectiveDeviceId],
     queryFn: async () => {
-      const res = await fetch(`/api/readings?deviceId=${encodeURIComponent(currentDeviceId)}&limit=1`);
+      const res = await fetch(`/api/readings?deviceId=${encodeURIComponent(effectiveDeviceId)}&limit=1`);
       if (!res.ok) throw new Error('Failed to fetch latest reading');
       return res.json();
     },
-    enabled: !!currentDeviceId,
+    enabled: !!effectiveDeviceId,
     refetchInterval: 10000,
   });
   const deviceOnline = (() => {
+    // Prefer registry online flag for the selected device; fallback to latest reading
+    if (selectedFromRegistry && typeof selectedFromRegistry.online === 'boolean') {
+      return selectedFromRegistry.online;
+    }
     const r = latestReading && latestReading[0];
     if (!r) return false;
     const ageMs = Date.now() - new Date(r.createdAt).getTime();
-    return ageMs < 30_000; // consider device online if updated within 30s
+    return ageMs < 30_000;
   })();
 
-  // Initialize deviceId in URL if missing
+  // Initialize/sync deviceId in URL if missing
   useEffect(() => {
-    if (!currentDeviceId && deviceIds && deviceIds.length > 0) {
-      const id = deviceIds[0];
+    if (!currentDeviceId && devices && devices.length > 0) {
+      const id = devices[0].deviceId;
       const next = new URLSearchParams(searchParams);
       next.set('deviceId', id);
       setSearchParams(next, { replace: true });
     }
-  }, [currentDeviceId, deviceIds, searchParams, setSearchParams]);
+  }, [currentDeviceId, devices, searchParams, setSearchParams]);
+
+  // Validate: if current deviceId is not in registry, reset to first or remove
+  useEffect(() => {
+    if (currentDeviceId && devices) {
+      const exists = devices.some(d => d.deviceId === currentDeviceId);
+      if (!exists) {
+        const next = new URLSearchParams(searchParams);
+        if (devices.length > 0) next.set('deviceId', devices[0].deviceId);
+        else next.delete('deviceId');
+        setSearchParams(next, { replace: true });
+      }
+    }
+  }, [currentDeviceId, devices, searchParams, setSearchParams]);
 
   useEffect(() => {
     const timer = setInterval(() => setCurrentTime(new Date()), 1000);
@@ -79,37 +104,46 @@ export function Header({ onMenuClick }: HeaderProps) {
           <div className="flex items-center gap-4">
             {/* Global Device Selector or read-only badge if single/unknown */}
             <div>
-              {deviceIds && deviceIds.length > 1 ? (
+              {devicesError ? (
+                <Badge variant="destructive">Devices unavailable</Badge>
+              ) : devicesLoading ? (
+                <Badge variant="secondary" className="bg-muted">Loading devices...</Badge>
+              ) : devices && devices.length > 1 ? (
                 <Select
-                  value={currentDeviceId || deviceIds[0]}
+                  value={effectiveDeviceId}
                   onValueChange={(val) => {
                     const next = new URLSearchParams(searchParams);
                     next.set('deviceId', val);
                     setSearchParams(next);
                   }}
                 >
-                  <SelectTrigger className="w-[220px]">
-                    <SelectValue placeholder="Select device" />
+                  <SelectTrigger className="w-[260px]">
+                    <div className="truncate text-left w-full">{selectedLabel}</div>
                   </SelectTrigger>
                   <SelectContent>
-                    {deviceIds.map((id) => (
-                      <SelectItem key={id} value={id}>{id}</SelectItem>
+                    {(devices || []).map((d) => (
+                      <SelectItem key={d.deviceId} value={d.deviceId}>{`${d.name || d.deviceId}${d.online ? ' • Online' : ''}`}</SelectItem>
                     ))}
                   </SelectContent>
                 </Select>
-              ) : (
-                <Badge variant="secondary" className="bg-muted">{currentDeviceId || deviceIds?.[0] || 'esp32-001'}</Badge>
-              )}
+              ) : devices && devices.length === 1 ? (
+                <Badge variant="secondary" className="bg-muted">{devices[0].name || devices[0].deviceId}</Badge>
+              ) : null}
             </div>
 
             {(() => {
               const serverOk = online;
-              const deviceOk = deviceOnline;
+              const hasDevices = !!devices && devices.length > 0 && !devicesError;
+              const deviceOk = hasDevices && deviceOnline;
               let text = 'Online';
               let cls = 'bg-success/10 text-success';
               let variant: any = 'secondary';
               if (!serverOk) {
                 text = 'Server Offline';
+                cls = '';
+                variant = 'destructive';
+              } else if (!hasDevices) {
+                text = 'No devices connected';
                 cls = '';
                 variant = 'destructive';
               } else if (!deviceOk) {

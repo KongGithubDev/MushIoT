@@ -57,7 +57,7 @@ int PUMP_OFF_ABOVE = 45;  // turn pump OFF when moisture% > 45
 const unsigned long MIN_PUMP_ON_MS = 5000; // 5 seconds
 
 // Send interval in milliseconds
-const unsigned long SEND_INTERVAL_MS = 10000; // 10 seconds
+const unsigned long SEND_INTERVAL_MS = 60000; // 60 seconds
 // Poll settings interval
 const unsigned long SETTINGS_POLL_MS = 3000; // 3 seconds
 // =====================================

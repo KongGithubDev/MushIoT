@@ -26,8 +26,9 @@ import { useQuery } from "@tanstack/react-query";
 
 export default function Settings() {
   const { toast } = useToast();
-  const { online, checking, reconnect, canControl } = useConnection();
-  const { data: appSettings, refetch: refetchAppSettings, isFetching: fetchingAppSettings } = useQuery<any>({
+  const { online, checking, reconnect } = useConnection();
+  const canSave = online; // app settings are server-level; do not require deviceOnline
+  const { data: appSettings, refetch: refetchAppSettings, isFetching: fetchingAppSettings, isLoading: loadingAppSettings, isError: loadError, error } = useQuery<any>({
     queryKey: ["app-settings"],
     queryFn: async () => {
       const res = await fetch('/api/app-settings');
@@ -159,6 +160,8 @@ export default function Settings() {
     timezone: "UTC+0"
   });
 
+  const clampNum = (v: number, min: number, max: number) => Math.max(min, Math.min(max, Number.isFinite(v) ? v : min));
+
   const saveSettings = (category: string) => {
     // PATCH only the changed category back to server
     const payload: any = {};
@@ -171,11 +174,11 @@ export default function Settings() {
         break;
       case 'Sensor':
         payload.sensors = {
-          moistureThresholdLow: systemNumber(sensorSettings.moistureThresholdLow[0]),
-          moistureThresholdHigh: systemNumber(sensorSettings.moistureThresholdHigh[0]),
-          calibrationOffset: systemNumber(sensorSettings.calibrationOffset[0]),
-          sensorSensitivity: systemNumber(sensorSettings.sensorSensitivity[0]),
-          readingFrequency: systemNumber(sensorSettings.readingFrequency),
+          moistureThresholdLow: clampNum(systemNumber(sensorSettings.moistureThresholdLow[0]), 10, 50),
+          moistureThresholdHigh: clampNum(systemNumber(sensorSettings.moistureThresholdHigh[0]), 60, 100),
+          calibrationOffset: clampNum(systemNumber(sensorSettings.calibrationOffset[0]), -20, 20),
+          sensorSensitivity: clampNum(systemNumber(sensorSettings.sensorSensitivity[0]), 10, 100),
+          readingFrequency: clampNum(systemNumber(sensorSettings.readingFrequency), 1, 60),
         };
         break;
       case 'Notification':
@@ -237,6 +240,36 @@ export default function Settings() {
     }, 2000);
   };
 
+  // Top-level loading/error states
+  if (online && loadingAppSettings) {
+    return (
+      <div className="space-y-6">
+        <div className="flex items-center justify-between">
+          <div>
+            <h1 className="text-3xl font-bold text-foreground">Settings</h1>
+            <p className="text-muted-foreground">Loading settings...</p>
+          </div>
+        </div>
+        <Card><CardContent className="p-6">Fetching app settings...</CardContent></Card>
+      </div>
+    );
+  }
+
+  if (online && loadError) {
+    return (
+      <div className="space-y-6">
+        <div className="flex items-center justify-between">
+          <div>
+            <h1 className="text-3xl font-bold text-foreground">Settings</h1>
+            <p className="text-muted-foreground">Unable to load settings</p>
+          </div>
+          <Button variant="outline" onClick={() => refetchAppSettings()} disabled={fetchingAppSettings}>Retry</Button>
+        </div>
+        <Card><CardContent className="p-6 text-sm text-muted-foreground">{String((error as any)?.message || 'Unknown error')}</CardContent></Card>
+      </div>
+    );
+  }
+
   return (
     <div className="space-y-6">
       {!online && (
@@ -260,12 +293,9 @@ export default function Settings() {
       </div>
 
       <Tabs defaultValue="system" className="space-y-6">
-        <TabsList className="grid w-full grid-cols-5">
+        <TabsList className="grid w-full grid-cols-2 md:grid-cols-2">
           <TabsTrigger value="system">System</TabsTrigger>
-          <TabsTrigger value="connection">Connection</TabsTrigger>
           <TabsTrigger value="sensors">Sensors</TabsTrigger>
-          <TabsTrigger value="notifications">Notifications</TabsTrigger>
-          <TabsTrigger value="account">Account</TabsTrigger>
         </TabsList>
 
         <TabsContent value="system" className="space-y-6">
@@ -277,11 +307,11 @@ export default function Settings() {
                   System Configuration
                 </CardTitle>
                 <div className="flex gap-2">
-                  <Button variant="outline" onClick={() => resetSettings("System")} disabled={!canControl}>
+                  <Button variant="outline" onClick={() => resetSettings("System")} disabled={!canSave}>
                     <RotateCcw className="h-4 w-4 mr-2" />
                     Reset
                   </Button>
-                  <Button onClick={() => saveSettings("System")} disabled={!canControl}>
+                  <Button onClick={() => saveSettings("System")} disabled={!canSave}>
                     <Save className="h-4 w-4 mr-2" />
                     Save
                   </Button>
@@ -290,31 +320,7 @@ export default function Settings() {
             </CardHeader>
             <CardContent className="space-y-6">
               <div className="grid gap-6 md:grid-cols-2">
-                <div className="space-y-2">
-                  <Label>Device Name</Label>
-                  <Input
-                    value={systemSettings.deviceName}
-                    onChange={(e) => setSystemSettings(prev => ({ ...prev, deviceName: e.target.value }))}
-                  />
-                </div>
-
-                <div className="space-y-2">
-                  <Label>Language</Label>
-                  <Select 
-                    value={systemSettings.language} 
-                    onValueChange={(value) => setSystemSettings(prev => ({ ...prev, language: value }))}
-                  >
-                    <SelectTrigger>
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="en">English</SelectItem>
-                      <SelectItem value="th">ไทย (Thai)</SelectItem>
-                      <SelectItem value="es">Español</SelectItem>
-                      <SelectItem value="fr">Français</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </div>
+                {/* Device Name and Language removed per request */}
 
                 <div className="space-y-2">
                   <Label>Sync Interval (seconds)</Label>
@@ -322,6 +328,7 @@ export default function Settings() {
                     type="number"
                     value={systemSettings.syncInterval}
                     onChange={(e) => setSystemSettings(prev => ({ ...prev, syncInterval: parseInt(e.target.value) }))}
+                    onBlur={(e) => setSystemSettings(prev => ({ ...prev, syncInterval: clampNum(parseInt(e.target.value) || 10, 10, 300) }))}
                     min="10"
                     max="300"
                   />
@@ -333,113 +340,22 @@ export default function Settings() {
                     type="number"
                     value={systemSettings.dataRetention}
                     onChange={(e) => setSystemSettings(prev => ({ ...prev, dataRetention: parseInt(e.target.value) }))}
+                    onBlur={(e) => setSystemSettings(prev => ({ ...prev, dataRetention: clampNum(parseInt(e.target.value) || 7, 7, 365) }))}
                     min="7"
                     max="365"
                   />
+                  <p className="text-xs text-muted-foreground">Note: Data retention applies to analytics. Server TTL uses environment DATA_RETENTION_DAYS if configured.</p>
                 </div>
               </div>
 
               <Separator />
 
-              <div className="space-y-4">
-                <div className="flex items-center justify-between">
-                  <div className="space-y-1">
-                    <Label>Automatic Backup</Label>
-                    <p className="text-sm text-muted-foreground">Automatically backup system data</p>
-                  </div>
-                  <Switch
-                    checked={systemSettings.autoBackup}
-                    onCheckedChange={(checked) => setSystemSettings(prev => ({ ...prev, autoBackup: checked }))}
-                  />
-                </div>
-
-                <div className="flex items-center justify-between">
-                  <div className="space-y-1">
-                    <Label>Dark Mode</Label>
-                    <p className="text-sm text-muted-foreground">Use dark theme interface</p>
-                  </div>
-                  <Switch
-                    checked={systemSettings.darkMode}
-                    onCheckedChange={(checked) => setSystemSettings(prev => ({ ...prev, darkMode: checked }))}
-                  />
-                </div>
-              </div>
+              {/* Auto Backup and Dark Mode controls removed per request */}
             </CardContent>
           </Card>
         </TabsContent>
 
-        <TabsContent value="connection" className="space-y-6">
-          <Card>
-            <CardHeader>
-              <div className="flex items-center justify-between">
-                <CardTitle className="flex items-center gap-2">
-                  <Wifi className="h-5 w-5 text-primary" />
-                  Connection Settings
-                </CardTitle>
-                <div className="flex gap-2">
-                  <Button variant="outline" onClick={testConnection} disabled={!canControl}>
-                    Test Connection
-                  </Button>
-                  <Button onClick={() => saveSettings("Connection")} disabled={!canControl}>
-                    <Save className="h-4 w-4 mr-2" />
-                    Save
-                  </Button>
-                </div>
-              </div>
-            </CardHeader>
-            <CardContent className="space-y-6">
-              <div className="grid gap-6 md:grid-cols-2">
-                <div className="space-y-2">
-                  <Label>ESP32 API Endpoint</Label>
-                  <Input
-                    value={connectionSettings.apiEndpoint}
-                    onChange={(e) => setConnectionSettings(prev => ({ ...prev, apiEndpoint: e.target.value }))}
-                    placeholder="http://192.168.1.100:8080/api"
-                  />
-                </div>
-
-                <div className="space-y-2">
-                  <Label>Connection Timeout (seconds)</Label>
-                  <Input
-                    type="number"
-                    value={connectionSettings.timeout}
-                    onChange={(e) => setConnectionSettings(prev => ({ ...prev, timeout: parseInt(e.target.value) }))}
-                    min="5"
-                    max="60"
-                  />
-                </div>
-
-                <div className="space-y-2">
-                  <Label>WiFi SSID</Label>
-                  <Input
-                    value={connectionSettings.wifiSSID}
-                    onChange={(e) => setConnectionSettings(prev => ({ ...prev, wifiSSID: e.target.value }))}
-                  />
-                </div>
-
-                <div className="space-y-2">
-                  <Label>WiFi Password</Label>
-                  <Input
-                    type="password"
-                    value={connectionSettings.wifiPassword}
-                    onChange={(e) => setConnectionSettings(prev => ({ ...prev, wifiPassword: e.target.value }))}
-                  />
-                </div>
-              </div>
-
-              <div className="flex items-center justify-between">
-                <div className="space-y-1">
-                  <Label>Enable SSL/TLS</Label>
-                  <p className="text-sm text-muted-foreground">Use secure connection (recommended)</p>
-                </div>
-                <Switch
-                  checked={connectionSettings.enableSSL}
-                  onCheckedChange={(checked) => setConnectionSettings(prev => ({ ...prev, enableSSL: checked }))}
-                />
-              </div>
-            </CardContent>
-          </Card>
-        </TabsContent>
+        
 
         <TabsContent value="sensors" className="space-y-6">
           <Card>
@@ -449,7 +365,7 @@ export default function Settings() {
                   <Database className="h-5 w-5 text-primary" />
                   Sensor Configuration
                 </CardTitle>
-                <Button onClick={() => saveSettings("Sensor")} disabled={!canControl}>
+                <Button onClick={() => saveSettings("Sensor")} disabled={!canSave}>
                   <Save className="h-4 w-4 mr-2" />
                   Save
                 </Button>
@@ -487,35 +403,7 @@ export default function Settings() {
                   <p className="text-xs text-muted-foreground">Stop watering when moisture reaches this level</p>
                 </div>
 
-                <div className="space-y-2">
-                  <div className="flex justify-between">
-                    <Label>Calibration Offset</Label>
-                    <span className="text-sm font-medium">{sensorSettings.calibrationOffset[0]}%</span>
-                  </div>
-                  <Slider
-                    value={sensorSettings.calibrationOffset}
-                    onValueChange={(value) => setSensorSettings(prev => ({ ...prev, calibrationOffset: value }))}
-                    max={20}
-                    min={-20}
-                    step={1}
-                  />
-                  <p className="text-xs text-muted-foreground">Adjust sensor readings for accuracy</p>
-                </div>
-
-                <div className="space-y-2">
-                  <div className="flex justify-between">
-                    <Label>Sensor Sensitivity</Label>
-                    <span className="text-sm font-medium">{sensorSettings.sensorSensitivity[0]}%</span>
-                  </div>
-                  <Slider
-                    value={sensorSettings.sensorSensitivity}
-                    onValueChange={(value) => setSensorSettings(prev => ({ ...prev, sensorSensitivity: value }))}
-                    max={100}
-                    min={10}
-                    step={10}
-                  />
-                  <p className="text-xs text-muted-foreground">Adjust sensor response sensitivity</p>
-                </div>
+                {/* Calibration Offset and Sensor Sensitivity removed per request */}
 
                 <div className="grid gap-4 md:grid-cols-2">
                   <div className="space-y-2">
@@ -524,6 +412,7 @@ export default function Settings() {
                       type="number"
                       value={sensorSettings.readingFrequency}
                       onChange={(e) => setSensorSettings(prev => ({ ...prev, readingFrequency: parseInt(e.target.value) }))}
+                      onBlur={(e) => setSensorSettings(prev => ({ ...prev, readingFrequency: clampNum(parseInt(e.target.value) || 5, 1, 60) }))}
                       min="1"
                       max="60"
                     />
@@ -534,184 +423,9 @@ export default function Settings() {
           </Card>
         </TabsContent>
 
-        <TabsContent value="notifications" className="space-y-6">
-          <Card>
-            <CardHeader>
-              <div className="flex items-center justify-between">
-                <CardTitle className="flex items-center gap-2">
-                  <Bell className="h-5 w-5 text-primary" />
-                  Notification Settings
-                </CardTitle>
-                <Button onClick={() => saveSettings("Notification")} disabled={!canControl}>
-                  <Save className="h-4 w-4 mr-2" />
-                  Save
-                </Button>
-              </div>
-            </CardHeader>
-            <CardContent className="space-y-6">
-              <div className="space-y-4">
-                <div className="flex items-center justify-between">
-                  <div className="space-y-1">
-                    <Label>Email Notifications</Label>
-                    <p className="text-sm text-muted-foreground">Receive alerts via email</p>
-                  </div>
-                  <Switch
-                    checked={notificationSettings.emailNotifications}
-                    onCheckedChange={(checked) => setNotificationSettings(prev => ({ ...prev, emailNotifications: checked }))}
-                  />
-                </div>
+        
 
-                <div className="flex items-center justify-between">
-                  <div className="space-y-1">
-                    <Label>Push Notifications</Label>
-                    <p className="text-sm text-muted-foreground">Receive browser notifications</p>
-                  </div>
-                  <Switch
-                    checked={notificationSettings.pushNotifications}
-                    onCheckedChange={(checked) => setNotificationSettings(prev => ({ ...prev, pushNotifications: checked }))}
-                  />
-                </div>
-
-                <div className="flex items-center justify-between">
-                  <div className="space-y-1">
-                    <Label>Sound Alerts</Label>
-                    <p className="text-sm text-muted-foreground">Play sound for important alerts</p>
-                  </div>
-                  <Switch
-                    checked={notificationSettings.soundAlerts}
-                    onCheckedChange={(checked) => setNotificationSettings(prev => ({ ...prev, soundAlerts: checked }))}
-                  />
-                </div>
-              </div>
-
-              <Separator />
-
-              <div className="grid gap-4 md:grid-cols-2">
-                <div className="space-y-2">
-                  <Label>Email Address</Label>
-                  <Input
-                    type="email"
-                    value={notificationSettings.emailAddress}
-                    onChange={(e) => setNotificationSettings(prev => ({ ...prev, emailAddress: e.target.value }))}
-                  />
-                </div>
-
-                <div className="space-y-2">
-                  <Label>Alert Frequency</Label>
-                  <Select 
-                    value={notificationSettings.alertFrequency} 
-                    onValueChange={(value) => setNotificationSettings(prev => ({ ...prev, alertFrequency: value }))}
-                  >
-                    <SelectTrigger>
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="immediate">Immediate</SelectItem>
-                      <SelectItem value="hourly">Hourly Digest</SelectItem>
-                      <SelectItem value="daily">Daily Summary</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </div>
-              </div>
-            </CardContent>
-          </Card>
-        </TabsContent>
-
-        <TabsContent value="account" className="space-y-6">
-          <Card>
-            <CardHeader>
-              <div className="flex items-center justify-between">
-                <CardTitle className="flex items-center gap-2">
-                  <User className="h-5 w-5 text-primary" />
-                  Account Settings
-                </CardTitle>
-                <Button onClick={() => saveSettings("Account")} disabled={!canControl}>
-                  <Save className="h-4 w-4 mr-2" />
-                  Save
-                </Button>
-              </div>
-            </CardHeader>
-            <CardContent className="space-y-6">
-              <div className="grid gap-4 md:grid-cols-2">
-                <div className="space-y-2">
-                  <Label>Username</Label>
-                  <Input
-                    value={userSettings.username}
-                    onChange={(e) => setUserSettings(prev => ({ ...prev, username: e.target.value }))}
-                  />
-                </div>
-
-                <div className="space-y-2">
-                  <Label>Timezone</Label>
-                  <Select 
-                    value={userSettings.timezone} 
-                    onValueChange={(value) => setUserSettings(prev => ({ ...prev, timezone: value }))}
-                  >
-                    <SelectTrigger>
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="UTC+0">UTC+0 (GMT)</SelectItem>
-                      <SelectItem value="UTC+7">UTC+7 (Bangkok)</SelectItem>
-                      <SelectItem value="UTC-5">UTC-5 (New York)</SelectItem>
-                      <SelectItem value="UTC+1">UTC+1 (Berlin)</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </div>
-              </div>
-
-              <Separator />
-
-              <div className="space-y-4">
-                <h4 className="font-medium flex items-center gap-2">
-                  <Shield className="h-4 w-4" />
-                  Change Password
-                </h4>
-                
-                <div className="grid gap-4 md:grid-cols-1 max-w-md">
-                  <div className="space-y-2">
-                    <Label>Current Password</Label>
-                    <Input
-                      type="password"
-                      value={userSettings.currentPassword}
-                      onChange={(e) => setUserSettings(prev => ({ ...prev, currentPassword: e.target.value }))}
-                    />
-                  </div>
-
-                  <div className="space-y-2">
-                    <Label>New Password</Label>
-                    <Input
-                      type="password"
-                      value={userSettings.newPassword}
-                      onChange={(e) => setUserSettings(prev => ({ ...prev, newPassword: e.target.value }))}
-                    />
-                  </div>
-
-                  <div className="space-y-2">
-                    <Label>Confirm New Password</Label>
-                    <Input
-                      type="password"
-                      value={userSettings.confirmPassword}
-                      onChange={(e) => setUserSettings(prev => ({ ...prev, confirmPassword: e.target.value }))}
-                    />
-                  </div>
-                </div>
-
-                <Button 
-                  variant="outline" 
-                  onClick={() => {
-                    toast({
-                      title: "Password Updated",
-                      description: "Your password has been changed successfully.",
-                    });
-                  }}
-                >
-                  Update Password
-                </Button>
-              </div>
-            </CardContent>
-          </Card>
-        </TabsContent>
+        
       </Tabs>
     </div>
   );

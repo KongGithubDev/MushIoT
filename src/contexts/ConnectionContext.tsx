@@ -20,21 +20,27 @@ export const ConnectionProvider: React.FC<{ children: React.ReactNode }> = ({ ch
   const [searchParams] = useSearchParams();
   const currentDeviceId = searchParams.get('deviceId') || '';
 
-  const check = useCallback(async () => {
+  const check = useCallback(async (minDurationMs: number = 0) => {
     setChecking(true);
+    const start = Date.now();
     try {
       const res = await fetch("/api/health", { cache: "no-store" });
       setOnline(res.ok);
     } catch {
       setOnline(false);
     } finally {
+      const elapsed = Date.now() - start;
+      if (minDurationMs > 0 && elapsed < minDurationMs) {
+        await new Promise((r) => setTimeout(r, minDurationMs - elapsed));
+      }
       setLastChecked(new Date());
       setChecking(false);
     }
   }, []);
 
   const reconnect = useCallback(async () => {
-    await check();
+    // enforce a small delay to make the UX feel responsive (avoid flicker)
+    await check(1200);
   }, [check]);
 
   useEffect(() => {

@@ -46,29 +46,37 @@ export default function Dashboard() {
   const { online } = useConnection();
   const [searchParams, setSearchParams] = useSearchParams();
   // Device selection
-  const { data: deviceIds } = useQuery<string[]>({
-    queryKey: ["devices"],
+  type DeviceItem = { deviceId: string; name?: string; online?: boolean };
+  const { data: registry } = useQuery<DeviceItem[]>({
+    queryKey: ["devices", "registry"],
     queryFn: async () => {
-      const res = await fetch(`/api/devices`);
-      if (!res.ok) throw new Error(`Failed to fetch devices: ${res.status}`);
+      const res = await fetch(`/api/devices/registry`);
+      if (!res.ok) throw new Error(`Failed to fetch device registry: ${res.status}`);
       return res.json();
     },
     refetchInterval: 15000,
   });
   const deviceId = useMemo(() => {
     const fromUrl = searchParams.get('deviceId');
-    if (fromUrl) return fromUrl;
-    return deviceIds?.[0] ?? "esp32-001";
-  }, [deviceIds, searchParams]);
+    if (fromUrl && (registry || []).some(d => d.deviceId === fromUrl)) return fromUrl;
+    const first = registry && registry[0]?.deviceId;
+    return first || '';
+  }, [registry, searchParams]);
 
   // If URL has no deviceId yet, set it so Header can pick it up immediately
   useEffect(() => {
-    if (!searchParams.get('deviceId') && deviceId) {
+    const inUrl = searchParams.get('deviceId');
+    const validInUrl = inUrl && (registry || []).some(d => d.deviceId === inUrl);
+    const first = registry && registry[0]?.deviceId;
+    if (!validInUrl) {
       const next = new URLSearchParams(searchParams);
-      next.set('deviceId', deviceId);
+      if (first) next.set('deviceId', first);
+      else next.delete('deviceId');
       setSearchParams(next, { replace: true });
     }
-  }, [deviceId, searchParams, setSearchParams]);
+  }, [registry, searchParams, setSearchParams]);
+
+  const hasDevice = !!deviceId;
 
   const { data: readings, isLoading, isError, error, refetch, isFetching } = useQuery<Reading[]>({
     queryKey: ["readings", deviceId],
@@ -77,8 +85,10 @@ export default function Dashboard() {
       if (!res.ok) throw new Error(`Failed to fetch readings: ${res.status}`);
       return res.json();
     },
-    refetchInterval: 5000,
-    enabled: online && !!deviceId,
+    refetchInterval: 60000,
+    refetchOnWindowFocus: false,
+    refetchIntervalInBackground: false,
+    enabled: online && hasDevice,
   });
 
   // Device settings
@@ -90,7 +100,7 @@ export default function Dashboard() {
       return res.json();
     },
     refetchInterval: 10000,
-    enabled: online && !!deviceId,
+    enabled: online && hasDevice,
   });
 
   // Latest ACK from device (what is actually applied)
@@ -102,7 +112,7 @@ export default function Dashboard() {
       return res.json();
     },
     refetchInterval: 3000,
-    enabled: online && !!deviceId,
+    enabled: online && hasDevice,
   });
 
   // Latest reading (array is sorted desc by createdAt on the server)
@@ -151,6 +161,32 @@ export default function Dashboard() {
       body: JSON.stringify({ pumpMode: mode })
     }).then(() => refetchSettings());
   };
+
+  // Empty state when no devices
+  if (!hasDevice) {
+    return (
+      <div className="space-y-6">
+        <div className="flex items-center justify-between">
+          <div>
+            <h1 className="text-3xl font-bold text-foreground">Dashboard</h1>
+            <p className="text-muted-foreground">Monitor your mushroom growing environment</p>
+          </div>
+        </div>
+
+        <Card>
+          <CardHeader>
+            <CardTitle>No device selected</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <p className="text-muted-foreground">Connect an ESP32 or run a simulator to get started.</p>
+            <div className="mt-4 flex flex-wrap gap-2">
+              <Button variant="outline" onClick={() => window.location.reload()}>Refresh</Button>
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-6">
@@ -221,7 +257,7 @@ export default function Dashboard() {
                   <TrendingUp className="h-5 w-5 text-primary" />
                   Soil Moisture Trend (24h)
                 </CardTitle>
-                <Badge variant="outline">{isFetching ? 'Refreshing...' : 'Real-time'}</Badge>
+                <Badge variant="outline">{isFetching ? 'Refreshing...' : 'Auto refresh: 60s'}</Badge>
               </div>
             </CardHeader>
             <CardContent>
@@ -251,7 +287,11 @@ export default function Dashboard() {
                       dataKey="moisture" 
                       stroke="hsl(var(--primary))" 
                       strokeWidth={3}
-                      dot={{ fill: 'hsl(var(--primary))', strokeWidth: 2, r: 4 }}
+                      strokeLinecap="round"
+                      isAnimationActive={true}
+                      animationDuration={700}
+                      animationEasing="ease-in-out"
+                      dot={{ fill: 'hsl(var(--primary))', strokeWidth: 2, r: 3 }}
                       activeDot={{ r: 6, fill: 'hsl(var(--primary-glow))' }}
                     />
                   </LineChart>
